@@ -1,0 +1,45 @@
+/*
+ * RK3588 EVB7 V11 AMP FIT (amp.img) - single bare-metal firmware on cpu3.
+ * Build: <u-boot>/tools/mkimage -f amp.its -E -p 0xe00 amp.img
+ * (run from this dir so ./amp1.bin resolves)
+ */
+/dts-v1/;
+/ {
+description = "RK3588 EVB7 V11 AMP FIT Image";
+#address-cells = <1>;
+
+images {
+amp1 {
+description = "baremetal-cpu3";
+data        = /incbin/("./amp1.bin");
+type        = "firmware";
+compression = "none";
+arch        = "arm64";
+cpu         = <0x300>;      /* cpu_l3 MPIDR */
+thumb       = <0>;
+hyp         = <0>;          /* EL1 */
+load        = <0x30000000>; /* dedicated AMP core region */
+udelay      = <1000000>;
+hash { algo = "sha256"; };
+};
+};
+
+configurations {
+default = "conf";
+conf {
+description = "RK3588 AMP images";
+rollback-index = <0x0>;
+loadables = "amp1";
+
+/* Linux stays on cpu0; entry/addrs come from U-Boot */
+linux {
+description = "linux-os";
+arch   = "arm64";
+cpu    = <0x000>;
+thumb  = <0>;
+hyp    = <0>;
+udelay = <1000000>;
+};
+};
+};
+};

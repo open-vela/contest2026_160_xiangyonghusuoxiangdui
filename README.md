@@ -1,148 +1,362 @@
-# contest2026_160_xiangyonghusuoxiangdui
+# 人物识别摄像头
 
-👋 欢迎参加 **2026 首届 openvela AI 硬件开发者大赛**！
-
-这是组委会为你的队伍创建的**专属参赛仓库**（本仓为样例/模板，队伍编号 `160`；你看到的将是你自己的 `contest2026_<编号>_<队伍名>`）。比赛期间，你的全部参赛代码、打包产物与 AI Coding 日志都提交到这里。
-
-> 本仓既是「代码仓」，又内置了一键拉取整套 openvela 工程的 `repo` 清单（manifest）。你只需跟它打交道，**自始至终只动一个文件夹**。
+在一块 RK3588 开发板上，让 **openvela(NuttX) 与 Linux 真正同时运行在同一颗 SoC 上**，
+由 NuttX 负责屏幕与交互，Linux 负责摄像头与 NPU，两者通过 rpmsg + 共享内存协作，
+最终呈现一个「实时人物识别摄像头」。
 
 ---
-
-## 一、先读这些官方文档
-
-**通用（所有赛道必读）：**
-
-| 文档                                                                                                                                     | 用途                                           |
-| ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| [《大赛总览》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/contest_overview.md)                        | 赛道、流程、评分、资源，建议先通读             |
-| [《参赛代码提交指南》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/code_submission_guide.md)           | 仓库获取、提交流程、时间与权限（**以此为准**） |
-| [《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md) | 如何导出 AI 对话日志并提交到 `logs/`           |
-
-**按你的赛道选读（三选一）：**
-
-| 赛道                  | 教程导航                                                                                                                                                 |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 快应用 / 手表应用创新 | [快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)                         |
-| AI 硬件产品创新       | [AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)              |
-| 新硬件适配            | [新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md) |
-
----
-
-## 二、第一步：拉取完整工程
-
-用组委会提供的命令一键拉取「openvela 全量源码 + 你的专属仓」：
-
-```bash
-repo init -u https://github.com/open-vela/contest2026_160_xiangyonghusuoxiangdui \
-  -b dev-ai-contest-2026 -m contest2026_160_xiangyonghusuoxiangdui.xml
-repo sync -c -j8
-```
-
-同步后，你的整个仓库位于工作区的 `contest2026_160_xiangyonghusuoxiangdui/`，openvela 全量源码在外层（`nuttx/`、`apps/`、`packages/`、`vendor/` 等）。
-
----
-
-## 三、第二步：在哪里写代码
-
-**只在自己的仓目录 `contest2026_160_xiangyonghusuoxiangdui/` 里开发。** 不同作品形态放在对应子目录，manifest 会通过 `<linkfile>` 把它们**软链**到 openvela 编译树该在的位置——你不用手动 copy：
-
-| 作品形态 | 你的代码放这里             | 系统自动映射到                                 |
-| -------- | -------------------------- | ---------------------------------------------- |
-| 应用     | `app/hello_app/`           | `packages/demos/contest2026_160_hello_app`     |
-| 快应用   | `quickapp/hello_quickapp/` | `packages/apps/contest2026_160_hello_quickapp` |
-| 板级适配 | `board/contest_board/`     | `vendor/openvela/boards/contest2026_160_board` |
-
-> 用不到的形态目录可以删掉；新增作品时按同样规则加子目录，并在 `contest2026_160_xiangyonghusuoxiangdui.xml` 里补一条 `<linkfile>` 映射即可。**生产仓库（packages/nuttx/vendor 等）零改动。**
-
-建议仓库目录约定（便于评委定位）：
-
-```text
-app/ | quickapp/ | board/   # 你的作品代码
-logs/                       # AI Coding 日志（主动导出后提交，格式见 logs/README.md）
-README.md                   # 作品说明（提交前请改成你自己的，见第六节）
-```
-
-> 仓内附带了一个 `.gitignore.example`，给出了**编译产物**等不需要进仓的文件示例。如需启用，`cp .gitignore.example .gitignore` 后按需增删即可。**注意 `logs/` 下最终导出的 AI Coding 日志必须提交，不要忽略。**
->
-> `logs/` 的目录结构与提交格式见 [logs/README.md](logs/README.md)。
-
----
-
-## 四、第三步：编译与运行
-
-编译/运行步骤随作品形态不同而不同，请参考你所在赛道的教程导航：
-
-- 快应用 / 手表应用：[快应用教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/quickapp/quickapp_guide_index.md)（含模拟器与开发板部署）。
-- AI 硬件产品创新：[AI 硬件赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_hardware/ai_hardware_guide_index.md)（环境搭建、编译烧录、Skill 开发）。
-- 新硬件适配：[新硬件适配赛道教程导航](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/hardware_porting/hardware_porting_guide_index.md)（BSP 移植、最小 NSH 基线）。
-
-子目录已通过 manifest 中的 `<linkfile>` 软链进 openvela 编译树，因此构建在 openvela 工作区**根目录**（即你这个仓的上一级）进行。openvela 使用 `build.sh` 作为统一入口，接收一个 **board config 路径**作为参数：
-
-```bash
-# 进入 openvela 工作区根目录（你的仓的上一级）
-cd ..
-
-# 通用语法：第一个参数是 board config 路径，第二个参数可以是 menuconfig / distclean 等
-./build.sh <board-config-path> [menuconfig|distclean] [-j8]
-```
-
-> 具体的 board config 路径、目标产物、模拟器/真机部署方式请以你所在赛道的教程导航为准。本仓 `app/` `quickapp/` `board/` 三个示例骨架对应的 Kconfig 选项可通过 `menuconfig` 启用。
-
----
-
-## 五、第四步：提交作品
-
-1. **fork** 你的专属仓 → 开发 → `git commit` 并推送 → 向专属仓发起 **Pull Request**，可**自行 review 并合入**（无需等组委会）。
-2. **AI Coding 日志**：与 AI 工具的对话会自动记录到本机 staging（不会自动上传），需你**主动导出/打包**选定会话到仓内 `logs/` 目录后一并提交。详见[《AI Coding 日志归集与提交手册》](https://github.com/open-vela/docs/blob/dev-ai-contest-2026/zh-cn/contest_2026/ai_coding_log_guide.md)。
-3. 若需改动 **nuttx 等公共仓库**，不在本仓改，而是 fork 对应公共仓、以 PR 提交到 `dev-ai-contest-2026` 分支，由组委会 review 后合入。
-
-> ⏰ **提交作品截止：9 月 20 日**。截止后统一收回 push 权限，仍可查看 / clone。
->
-> 获奖后再按要求将作品 PR 至 openvela 上游对应仓库（走标准 PR + CI 流程）。
-
-### 关于 PR 与 CLA
-
-- 本仓所有改动通过 **Pull Request** 合入（分支保护强制，可自行合入自己的 PR）。
-- 首次贡献需在[**官网签署 CLA**](https://openvela.com/#/community/cla)；PR 上会自动跑 `cla/signature` 检查，在官网签署成功后，在 PR 评论 `/check-cla` 复检即可通过。
-
----
-
-## 六、提交前：把本 README 改成你的作品说明
-
-本文件目前是组委会给的**使用说明书**。**作品提交前，请把它替换成你自己作品的说明**，方便评委快速了解你做了什么、怎么跑起来。建议至少包含以下内容：
-
-```markdown
-# <你的作品名>
 
 ## 一、作品简介
-<一句话/一段话说明这个作品是什么、解决什么问题、亮点在哪>
 
-## 二、选题方向
-<快应用 / 手表应用创新 ｜ AI 硬件产品创新 ｜ 新硬件适配 ｜ 自定方向，并简述理由>
+**一句话**：把 openvela 移植到 RK3588 的一颗 A55 和一颗 PMU Cortex-M0 上，
+与 Linux 三域并行，做成一个 NuttX 出画面、Linux 出算力的实时人物识别摄像头。
 
-## 三、目录结构
-<列出你这个仓里各目录/文件的作用，例如：>
-- `app/xxx/`        — <说明>
-- `board/xxx/`      — <说明>
-- `quickapp/xxx/`   — <说明>
-- `logs/`           — AI Coding 日志
-- `docs/` 或其他    — <说明>
+**它解决什么问题。**
+AI 硬件常见的两难：想要 RTOS 的确定性与低启动延迟（UI 不卡、可控），
+又需要 Linux 那套庞大的驱动生态与 NPU 工具链（摄像头 ISP、RKNN 都只有 Linux 有）。
+通常只能二选一，或者上两颗芯片。本作品在**一颗 SoC 内部**用 AMP 把两者合起来：
 
-## 四、运行方式
-<拉取工程后，如何编译、烧录/部署、运行的完整步骤；最好能让评委照着一步步复现>
+- **NuttX（cpu_l3）**：直接编程 VOP 的 Esmart3 硬件窗口把自己的 framebuffer 扫上屏，
+  跑 LVGL 界面，处理触摸。不依赖 Linux 的图形栈，Linux 崩了它照样在画。
+- **Linux（7×A55）**：拥有 imx415 → CSI → ISP 这条深度驱动的采集链，以及 RKNN NPU 推理。
+- **NuttX（PMU Cortex-M0）**：第三个域，独立 RTOS 实例，验证了这颗一直闲置的 M0 可用。
 
-## 五、AI Coding 使用说明
-<说明本作品如何借助 AI 辅助开发：
-- 在需求拆解 / 方案设计 / 编码 / 调试 / 文档等环节如何与 AI 协作；
-- AI 对开发效率或质量带来的实际帮助。
-完整对话日志见 logs/ 目录>
-```
+**亮点。**
 
-> 提示：将会根据「作品本身 + 你的 README 说明 + `logs/` 里的 AI Coding 日志」来理解和评估你的作品，README 写清楚很重要。
+1. **三个域、两种指令集、两个独立 NuttX 实例，共用一根调试串口。**
+   两个 NuttX 的 nsh 都通过 rpmsg 隧道成 Linux 侧的 `/dev/ttyNSH0` / `/dev/ttyNSH1`，
+   不占物理 UART，随时可交互调试。
+2. **把 RK3588 的 PMU Cortex-M0 点亮并跑上了 NuttX。**
+   这颗 M0 在官方 RK3588 AMP 参考里只占一块保留内存，没有 rpmsg link、没有示例固件。
+   我们从 TRM 的地址重映射表推出取指窗口/外设窗口/SysTick，做出了完整的 ARMv6-M chip 层
+   （`arch/arm/src/rk3588-m0/`），并让它也跑起了 nsh。
+3. **NuttX 侧显示不经过 Linux。** 从 Linux 的 VOP 手里摘出一个硬件图层（reserved-plane），
+   NuttX 双缓冲 + 原地扫描，无 memcpy、无撕裂。
+4. **修了一个 NuttX 通用层的 bug 和一个 GICv3 通用缺陷**，不只是加板级代码：
+   - `arm64_gicv3.c`：原来按 `up_cpu_index()` 算 redistributor 基址，AMP 下永远选中 cpu0 的
+     GICR，从核的 timer PPI 永远不使能。改为按 MPIDR affinity 匹配 `GICR_TYPER` 探测本核。
+   - `drivers/serial/uart_rpmsg.c`：`dmasend` 阻塞等发送缓冲会与对端互锁；首次 NS announce
+     必丢且不重试。均已修正。
+5. **全链开机自启动**，上电即用，不需要手敲任何命令。
+
+**实测数据**（真机，非估算）：
+相机页 21.2 fps（71 个周期统计）；双路 ISP 两路满帧零丢帧（30.0 / 30.2 fps，`gaps 0/0`）；
+NPU 推理均值 22.1ms；`person` 是检出最多的类；零断言、零应用层报错、冷启动 ×2 顺序一致。
 
 ---
 
-## 附：仓库命名规范
+## 二、选题方向
 
-`contest2026_<编号>_<队伍名>` — 编号三位零填充；队名 slug（全小写、英文/拼音、连字符）。例：`contest2026_160_xiangyonghusuoxiangdui`。
-（仓库由组委会统一创建，**每队仅一个仓**，无需自行命名。）
+**新硬件适配**（主）。
+
+理由：本作品的主体工作量是把 openvela 移植到两个此前不被支持的目标上 ——
+
+| 目标 | 此前状态 | 我们做了什么 |
+|---|---|---|
+| RK3588 A55（cpu_l3, AArch64） | openvela 只有 rk3399 的 arm64 chip 层 | 新建 `arch/arm64/src/rk3588/` 完整 chip 层 + `boards/arm64/rk3588/evb7-amp/` |
+| RK3588 PMU Cortex-M0（ARMv6-M） | **完全没有**，官方 AMP 参考也没有 | 新建 `arch/arm/src/rk3588-m0/` + `boards/arm/rk3588-m0/evb7-m0/` |
+
+移植不是"能打印 hello"就算完 —— 定时器、GIC 与 Linux 共存、rpmsg 传输层、中断化接收、
+MMU/cache 一致性、控制台复用，每一层都在真机上验证过，并且顺手修了 NuttX 通用层的两处缺陷。
+
+**同时也覆盖 AI 硬件产品创新**：成品本身是一个带 NPU 实时人物识别的摄像头终端，
+LVGL 界面 + 触摸交互 + 开机自启，是可演示的产品形态，不只是移植 demo。
+
+---
+
+## 三、目录结构
+
+### 3.1 本仓目录
+
+```text
+contest2026_160_xiangyonghusuoxiangdui/
+├── README.md                          本文件
+├── amp1.c / amp_start.S / amp.ld      最早的 A55 裸机验证固件（AMP 拉核链路的第一块试金石）
+├── build.sh                           编译上面那个裸机固件
+├── amp.its                            FIT 描述：把固件打进 amp.img
+├── parameter-amp.txt                  分区表：在官方分区表上加 16MB `amp` 分区
+├── app/hello_app/                     应用形态占位（本作品的 NuttX 应用见 §3.2）
+├── board/contest_board/               板级形态占位（本作品的板级代码见 §3.2）
+├── quickapp/hello_quickapp/           快应用占位（本作品未使用）
+└── logs/                              AI Coding 日志（见 §五）
+    ├── e0295e74ccbf7137/              Kiro 会话原始记录（session.json + messages.jsonl）
+    ├── e0295e74ccbf7137.jsonl         会话索引
+    └── .kiro/
+        ├── board-changes/             ★ 开发全过程的工程日志，见下
+        │   ├── rk3588-evb7-v11.md              主 changelog，6700+ 行，逐个里程碑
+        │   ├── SETUP-rk3588-evb7-v11.md        从零搭建手册（评委复现看这份）
+        │   ├── HANDOFF-rk3588-evb7-v11.md      跨会话交接文档
+        │   ├── rk3588-evb7-v11-AMP-overview.md
+        │   └── rk3588-evb7-v11-SESSION-SUMMARY.md
+        └── skills/                    自定义 AI skill（见 §五）
+            ├── board-change-tracker/
+            └── session-handoff/
+```
+
+> **`logs/.kiro/board-changes/rk3588-evb7-v11.md` 是理解本作品最快的入口。**
+> 它按里程碑记录了每一步改了什么、为什么、真机验证结果，以及**每一次判断错误和它的根因**
+> （包括三次被"看起来像成功的返回值"骗到的经过）。这份文档本身就是 AI 协作的产物与证据。
+
+### 3.2 作品主体源码位置
+
+本作品跨 6 棵源码树，`repo sync` 后位于 openvela 工作区中：
+
+| 树 | 路径 | 本作品的改动 |
+|---|---|---|
+| NuttX | `nuttx/` | **73 个文件**：两套 chip 层（arm64 rk3588 / arm rk3588-m0）、两套 board 层、3 处通用 arch 修复 |
+| NuttX apps | `apps/` | `examples/ampui/`（LVGL 主页+相机页）、`examples/ampcam/`（帧查看与统计） |
+| Linux 内核 | 外部 BSP 树 | AMP dts、Mali G610 / WiFi-BT 两个 config fragment、`drivers/tty/rpmsg_nsh_tty.c` |
+| u-boot | 外部 vendor 树 | `configs/rk3588_defconfig` 开 `CONFIG_AMP` |
+| AMP 载荷与 Linux 用户态 | `rk3588-amp-demo/` | `amp_fb_show.c`（采集/转换/推理/旋转/发布）、FIT 描述、systemd unit、主机侧回归测试 |
+| 构建记录 | 本仓 `logs/.kiro/` | changelog + skills |
+
+各文件逐条清单见 `logs/.kiro/board-changes/rk3588-evb7-v11.md` 的各里程碑「改动」表。
+
+**关键源码导航**（想直接看代码的话）：
+
+```text
+nuttx/arch/arm64/src/rk3588/rk3588_rptun.c        cpu_l3 的 rpmsg 传输层（中断驱动 RX）
+nuttx/arch/arm/src/rk3588-m0/rk3588m0_rptun.c     M0 的 rpmsg 传输层（INTMUX→NVIC）
+nuttx/arch/arm/src/rk3588-m0/hardware/rk3588m0_memorymap.h
+                                                   ★ TRM 地址重映射模型写成代码，含踩坑注释
+nuttx/boards/arm64/rk3588/evb7-amp/src/evb7_amp_vop.c    直接编程 Esmart3 硬件图层
+nuttx/boards/arm64/rk3588/evb7-amp/src/evb7_amp_fb.c     /dev/fb0
+nuttx/boards/arm64/rk3588/evb7-amp/src/evb7_amp_cam.c    摄像头/检测结果消费端（seqlock）
+nuttx/boards/arm64/rk3588/evb7-amp/src/evb7_amp_shm.h    ★ 两侧唯一的共享内存契约
+apps/examples/ampui/ampui_main.c                   LVGL 应用
+rk3588-amp-demo/amp_fb_show.c                      Linux 侧：V4L2 + RGA + RKNN + 发布
+```
+
+---
+
+## 四、运行方式
+
+> 完整版（含官方固件基线、分区表改造、四套工具链、回退方案、13 条踩坑速查）见
+> **`logs/.kiro/board-changes/SETUP-rk3588-evb7-v11.md`**。下面是骨架流程。
+
+### 4.0 硬件与前提
+
+- RK3588 EVB7 V11 开发板（MIPI-DSI 屏、imx415 摄像头、AP6398S WiFi/BT）
+- 串口 **UART2 @ 1500000** 8N1，Linux 控制台 `ttyFIQ0`
+- 启动介质 **eMMC**（SD 卡启动无输出）
+- 主机：Linux，装 `rkdeveloptool`、`adb`、`picocom`、`u-boot-tools`
+
+**四套工具链，对应关系不能混：**
+
+| 用途 | 工具链 |
+|---|---|
+| Linux 内核 + Linux 用户态 | 系统 `aarch64-linux-gnu-gcc` |
+| vendor u-boot 2017.09 | **linaro 6.3.1-2017.05**（系统 GCC 编不过） |
+| NuttX cpu_l3 | `aarch64-none-elf`（openvela prebuilts） |
+| NuttX M0 | `arm-none-eabi`（openvela prebuilts） |
+
+### 4.1 先刷官方固件，确认板子是好的
+
+**不要跳过。** 后续都是在这个基线上做增量，出问题时需要能回退区分硬件还是改动。
+
+```bash
+cd <官方固件>/rockdev
+rkdeveloptool db MiniLoaderAll.bin
+rkdeveloptool ul MiniLoaderAll.bin      # ⚠️ ul 不能省，否则 eMMC 残留旧 SPL → 复位循环
+rkdeveloptool gpt parameter.txt
+for p in uboot boot rootfs oem userdata; do rkdeveloptool wlx $p $p.img; done
+rkdeveloptool rd
+```
+
+### 4.2 编译
+
+```bash
+# --- u-boot（AMP 已烤进 defconfig，因为 make.sh 每次重跑 defconfig 会冲掉 merged .config）
+cd <u-boot>
+export PATH=<prebuilts>/gcc-linaro-6.3.1-2017.05-x86_64_aarch64-linux-gnu/bin:$PATH
+./make.sh rk3588
+#   → uboot.img + rk3588_spl_loader_v1.21.114.bin
+
+# --- Linux 内核 + boot.img
+cd <kernel>
+export ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu-
+make rockchip_linux_defconfig
+./scripts/kconfig/merge_config.sh -m -O . .config \
+    arch/arm64/configs/rk3588_g610.config \
+    arch/arm64/configs/rk3588_wifibt.config
+make olddefconfig && make -j$(nproc) Image modules
+make rockchip/rk3588-evb7-v11-linux-amp.dtb
+./scripts/resource_tool arch/arm64/boot/dts/rockchip/rk3588-evb7-v11-linux-amp.dtb \
+    logo.bmp logo_kernel.bmp
+./scripts/mkbootimg --kernel arch/arm64/boot/Image --second resource.img -o boot.img
+
+# --- NuttX cpu_l3（AArch64）
+cd nuttx
+export PATH=<prebuilts>/aarch64-none-elf/bin:$PATH
+make distclean && ./tools/configure.sh -l evb7-amp:nsh && make -j8
+cp nuttx.bin <rk3588-amp-demo>/nuttx.bin
+
+# --- NuttX M0（ARMv6-M）⚠️ 与上面共用同一棵树，必须 distclean，先保住上一个产物
+export PATH=<prebuilts>/arm-none-eabi/bin:$PATH
+make distclean && ./tools/configure.sh -l evb7-m0:nsh && make -j8
+cp nuttx.bin <rk3588-amp-demo>/m0/nuttx-m0.bin
+
+# --- 打包 amp.img（一个 FIT 装两个固件）
+cd <rk3588-amp-demo>
+<u-boot>/tools/mkimage -f amp-m0-nuttx.its -E -p 0xe00 amp.img
+
+# --- Linux 用户态
+RK=<rknn-toolkit2>/rknpu2/runtime/Linux/librknn_api/include
+RGA=<rknn-toolkit2>/rknpu2/examples/3rdparty/rga/include
+aarch64-linux-gnu-gcc -O2 -ftree-vectorize -Wall -Wextra -pthread -DAMP_WITH_RKNN \
+    -I$RK -I$RGA -idirafter <kernel>/include/uapi -o amp_fb_show amp_fb_show.c
+./tests/run.sh          # 主机侧回归：200 种子 yolo 解码对比 + emit 12 项 + 触摸解码
+```
+
+> ⚠️ `amp-m0-nuttx.its` 里 M0 那个 image 的 **`uc_start`/`uc_end` 不是可选项**。
+> 缺了它，u-boot 会静默落进 `__weak` 空桩、**照样打印 `...OK`**，而 M0 的取指地址从未编程、
+> 复位从未解除。这个坑吃掉了两轮上板。
+
+### 4.3 刷机（首次，含改分区表加 `amp` 分区）
+
+```bash
+cd <rk3588-amp-demo>
+rkdeveloptool db <官方>/MiniLoaderAll.bin
+rkdeveloptool ul <官方>/MiniLoaderAll.bin
+rkdeveloptool gpt parameter-amp.txt              # amp @0x01cb8000 16MB；userdata 后移
+rkdeveloptool wlx uboot    <u-boot>/uboot.img
+rkdeveloptool wlx boot     <kernel>/boot.img
+rkdeveloptool wlx amp      amp.img
+rkdeveloptool wlx rootfs   <官方>/rootfs.img
+rkdeveloptool wlx oem      <官方>/oem.img
+rkdeveloptool wlx userdata <官方>/userdata.img   # ⚠️ 必刷，否则 systemd 掉 emergency
+rkdeveloptool rd
+```
+
+日常只改 NuttX 时：`rkdeveloptool db <spl_loader>; wlx amp amp.img; rd`（几秒钟）。
+改了 dts 才需要连 `boot` 一起刷。
+
+### 4.4 板上部署
+
+```bash
+adb push <kernel>/drivers/net/wireless/rockchip_wlan/rkwifi/bcmdhd/bcmdhd.ko /lib/modules/
+adb push <kernel>/drivers/rpmsg/rpmsg_char.ko  /userdata/
+adb push <kernel>/drivers/tty/rpmsg_nsh_tty.ko /userdata/
+adb push <rk3588-amp-demo>/amp_fb_show /userdata/ && adb shell "chmod +x /userdata/amp_fb_show"
+adb shell "mkdir -p /userdata/npu-a17"
+adb push <rk3588-amp-demo>/npu-a17/. /userdata/npu-a17/     # librknnrt.so librga.so 模型 标签
+adb push <rk3588-amp-demo>/deploy/. /userdata/deploy/       # ⚠️ 结尾的 /. 不能少，否则嵌套成 deploy/deploy/
+adb shell "cd /userdata/deploy && ./install.sh"
+adb shell reboot
+```
+
+`install.sh` 会装好 4 个 systemd unit（WiFi / 蓝牙 / rpmsg 模块 / 摄像头 publisher）、
+关掉 NetworkManager 的 MAC 随机化（不关 WiFi 连不上）、并把默认 target 设为
+`multi-user`（桌面会抢 DRM master，导致 `amp_fb_show` 直接退出）。
+它在 `systemctl enable` 之前对每个 unit 做 `systemd-analyze verify` ——
+因为 `enable` 只建符号链接、不读文件内容，一个丢了 `[Unit]` 头的 unit 能被完美 enable，
+然后那一节里所有排序指令被静默丢弃（我们踩过）。
+
+### 4.5 验证
+
+重启后**不需要任何命令**，屏幕上应出现 LVGL 主页（带呼吸心跳点），
+点相机图标进入相机页，看到实时画面与人物识别框。
+
+```bash
+# AMP 是否生效
+nproc                                    # 7，不是 8 → cpu_l3 已交给 AMP
+dmesg | grep -i 'rpmsg host is online'   # 两条：virtio0(cpu_l3) + virtio1(M0)
+
+# M0 活体（关键判据：由 sleep(1) 驱动，递增即证明 SysTick + 调度器在跑）
+busybox devmem 0x07ae0000 32             # 0x414D5030 ("AMP0")
+busybox devmem 0x07ae0004 32             # 连读两次应 +1
+
+# 两个 NuttX 的 nsh（退出 Ctrl-A Ctrl-Q）
+picocom --imap lfcrlf --omap crlf /dev/ttyNSH0     # cpu_l3，uname 显示 aarch64
+picocom --imap lfcrlf --omap crlf /dev/ttyNSH1     # M0，uname 显示 arm / evb7-m0
+
+# 摄像头与识别
+journalctl -u amp-camera -f
+```
+
+回退：`rkdeveloptool wlx amp _a55_backup/amp.img.a55-nuttx-v9` 回到只有 cpu_l3 的版本；
+`_a55_backup/` 里每个备份对应退到哪一步在 SETUP 文档里列了表。
+
+---
+
+## 五、AI Coding 使用说明
+
+本作品**全程由 Kiro 辅助开发**。完整对话日志见 `logs/`，工程日志见
+`logs/.kiro/board-changes/`。这里说明协作方式，以及 AI 在哪些地方真正起了作用。
+
+### 5.1 协作方式：让 AI 维护一份"工程日志"，而不是只写代码
+
+这个项目的难点不在于单个函数怎么写，而在于**跨 6 棵源码树、几十个里程碑、每次验证都要重新刷机**，
+上下文极易丢失。所以我们做的第一件事是给 Kiro 写了两个自定义 skill：
+
+| skill | 作用 |
+|---|---|
+| `logs/.kiro/skills/board-change-tracker/` | 每做一次板级改动就立刻追加到 per-board changelog（改了什么/类型/为什么），收尾时做一次 git 交叉核对再一次性提交，确保没有改动漏提交 |
+| `logs/.kiro/skills/session-handoff/` | 上下文接近上限时产出一份自包含交接文档，新会话只读那一份就能续上 |
+
+产物就是 `rk3588-evb7-v11.md`（6700+ 行）。它不是事后补的文档，是**开发过程中实时长出来的**：
+每个里程碑的判据、真机日志片段、产物 md5、以及"这个数字为什么不可复现"都记在里面。
+`SETUP-rk3588-evb7-v11.md` 与本 README 都是从它整理出来的。
+
+### 5.2 各环节的实际分工
+
+**需求拆解 / 方案设计。** 关键决策都是先让 AI 把可选路径的代价量化再拍板。例：
+显示要不要让 NuttX 独占硬件？AI 去读了 rkcif/rkisp/vop2 的源码，指出
+"`vop_mmu` 是整个 VOP 共享一个、`irq_vop` 与 `vop_mmu` 共用 GIC_SPI 156 无法切分"，
+于是放弃独占、改走 reserved-plane。这类结论如果靠人读几万行 vendor 驱动，成本完全不同。
+
+**编码。** 两套 chip 层、两套 board 层、rpmsg 传输、LVGL 应用、Linux 侧
+`amp_fb_show.c` 的采集/RGA/RKNN/后处理，主体代码由 AI 写。人负责给约束、上板验证、
+判断哪些"看起来对"的结果不可信。
+
+**调试 —— AI 帮助最大的环节。** 几个例子：
+
+- **M0 点亮卡了三轮**。v1/v2 都推断是"地址重映射假设错了"，直到 AI 去读 u-boot
+  `standalone_handler()` 源码，发现 RK3588 只实现了 `fit_standalone_ext_release()`，
+  而 `.its` 不设 `uc_start/uc_end` 就会落进 `__weak` 空桩、**照样打印 `...OK`** ——
+  前两轮测的根本不是地址模型，M0 连执行机会都没有。
+- **重连必崩**查了四轮（当成死锁、当成堆越界写），最后由 `/proc/<pid>/stack` 与 Oops
+  定位到 `rpmsg_nsh_tty_install()` 漏了 `tty_port_get()`，kref 不平衡 → use-after-free。
+  对照上游 `rpmsg_tty.c` 确认了漏的正是那一句。
+- **NuttX 跑约 1027 帧后断言**：dts 的 carveout 改到 8MB 了，但 `rk3588_boot.c` 的 MMU 表
+  没跟着改。短了的 MMU 映射在启动时一声不响，只在第一次写到映射末尾之后才二级转换错误。
+
+**文档。** changelog、SETUP 手册、本 README 都由 AI 起草，人校对。
+
+### 5.3 一个我们认为更有价值的产出：把判断错误也记下来
+
+changelog 里专门留了「方法论」条目，记录**每一次判断错误的根因模式**，因为同一类错误反复出现：
+
+1. **"看起来像成功的返回值"骗了三次**：mailbox 驱动打印的 `version: 0x0100` 是驱动里的常量
+   （probe 全程只 `ioremap` 不碰硬件）；`open("/dev/ttym0") -> 0` 被读成"打开成功"，
+   而返回 **0** 的真实含义是 fd 0/1/2 全空；u-boot 的 `...OK` 来自 `__weak` 空桩。
+   → **先确认目标代码路径是否真被执行，再解释"执行结果为何不对"。**
+2. **NS 侧读 `GICD_IGROUPR` 是 RAZ（恒读 0）**，我们把它当成"中断被配成 Group0"，
+   由此推导出"必须改 BL31/OP-TEE 或换用 M0"，并真的去改了 OP-TEE、编译、刷机、启动卡死。
+   真因其实是 Linux `gic_dist_init` 关掉了所有 SPI。**整条推理链的起点是一个 RAZ 的 0。**
+3. **对称的测试测不出符号错**：检测框的坐标变换差 90°，而 8 项 emit 用例全绿，
+   因为它们全是对称的。补了角点方向用例才钉住。
+4. **软复位不清 DRAM**，`no-map` 区的旧 magic 会伪装成当前状态 ——
+   存在性判据必须换成单调递增的计数器。
+5. **一个"改尺寸"的需求要先 `grep` 出这个数字被写在几处**：`AMP_SHM_SIZE` 在三个地方
+   （dts / MMU 表 / 头文件），三种失败方式完全不同：dts 大声报错、MMU 静默到越界才炸、
+   头文件决定两侧算术。
+
+这些条目让后续里程碑的返工明显减少 —— 比如 M0 侧做中断化时，直接用 `static_assert`
+把从 TRM 推出的四个数字固化下来（`MBOX_RX_INTID == 99` 等），
+因为 IRQ 号算错的症状是**静默退化**：中断永不触发、被 100ms 兜底悄悄扛住、功能看起来完全正常。
+
+### 5.4 AI 带来的实际帮助
+
+- **读 vendor 代码的成本大幅下降。** RK3588 的 BSP 内核 + vendor u-boot 是几十万行、
+  几乎无文档。绝大多数关键结论（mailbox 握手要先写 DAT 再写 CMD、rockchip Linux 从不读
+  remote 的 resource table 所以要自己钉 `DRIVER_OK`、`rpmsg_char` 的 `id_table` 只认
+  `rpmsg-raw` 所以端点取这个名字就能零内核改动拿到 `/dev/rpmsg0`）都是 AI 读源码读出来的。
+- **每次上板前的自查更严。** 例如编完不只看"编过了"，而是 `objdump` 出 `g_mmu_regions`
+  确认那两个数真的进了二进制；`amp.img` 的 md5 因为 FIT 时间戳不可复现，所以锚点换成
+  里面 `nuttx.bin` 的 sha256。这些都是 AI 提出并固化进 changelog 的纪律。
+- **上下文可续。** 项目跨越数十个会话，靠 `board-change-tracker` 和交接文档，
+  新会话读一份文档就能接着干，不用重新发现已知结论。
+
+**日志位置**：`logs/e0295e74ccbf7137/`（Kiro 会话原始 JSONL）；
+工程日志与 skill 定义在 `logs/.kiro/`。

@@ -1,0 +1,15 @@
+[Unit]
+Description=Broadcom BT (AP6398S/BCM4359) HCI attach on /dev/ttyS9
+After=wifibt-init.service systemd-rfkill.service
+Wants=wifibt-init.service
+
+[Service]
+Type=simple
+ExecStartPre=-/usr/sbin/rfkill unblock bluetooth
+ExecStart=/usr/bin/brcm_patchram_plus1 --enable_hci --no2bytes --use_baudrate_for_download --tosleep 200000 --baudrate 1500000 --patchram /lib/firmware/brcm/ /dev/ttyS9
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 10); do hciconfig hci0 up 2>/dev/null && break; sleep 1; done'
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Load bcmdhd WiFi (AP6398S/BCM4359) kernel module
+After=systemd-modules-load.service
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# rfkill-wlan is a built-in driver and ready by now, so no SDIO race.
+ExecStart=/sbin/insmod /lib/modules/bcmdhd.ko
+ExecStop=-/sbin/rmmod bcmdhd
+
+[Install]
+WantedBy=multi-user.target

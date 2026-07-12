@@ -80,3 +80,26 @@ no-map reserved region; read it from Linux via /dev/mem.
     a=rd(0x804); time.sleep(1); print("count",a,"->",rd(0x804))'
   or busybox devmem 0x30000800 32 / 0x30000804 32.
 - PASS: magic==0x414d5033 and counter increments -> cpu3 is running the firmware.
+
+## Runtime deploy package (deploy/)
+
+Runtime bits for the OFFICIAL BSP Debian rootfs (WiFi/BT/desktop are userspace,
+not baked into the image). Copy `deploy/` to the board and run `install.sh`:
+
+- `bcmdhd.service`      — insmod /lib/modules/bcmdhd.ko at boot (WiFi AP6398S/BCM4359).
+- `brcm-bt.service`     — brcm_patchram_plus1 HCI attach on /dev/ttyS9 (BT).
+- `wifi-no-randmac.conf`— NetworkManager conf.d: disable WiFi MAC randomization
+                          (bcmdhd rejects MAC change while up -> NM 'config-failed').
+- `selftest.sh`         — installed as `rk3588-selftest`: checks AMP heartbeat,
+                          nproc, Mali GPU, desktop, WiFi, BT.
+- `install.sh`          — installs the above and enables the services.
+
+```sh
+# on the board, as root:
+cd deploy && ./install.sh
+reboot
+rk3588-selftest
+```
+
+Note: `/lib/modules/bcmdhd.ko` must already be present (deployed alongside the
+custom boot.img). `install.sh` warns if it is missing.

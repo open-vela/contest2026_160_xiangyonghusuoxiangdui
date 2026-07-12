@@ -1,12 +1,14 @@
 /* RK3588 AMP demo payload for cpu_l3 (MPIDR 0x300). Entry via amp_start.S (sets SP).
  * Proofs of life:
- *   UART5 (0xFEB80000) print (needs UART5 serial to observe)
+ *   UART2 (0xFEB50000) print - SHARED with Linux console (fiq-debugger).
+ *     Borrow-only: poll LSR.THRE + write THR, NEVER reconfigure baud/FIFO/LCR,
+ *     no IRQ (fiq-debugger owns the FIQ). Output interleaves with Linux log.
  *   Heartbeat in no-map amp-core region (Linux reads via /dev/mem):
  *     0x30000800 = magic 0x414D5033 ("AMP3"); 0x30000804 = counter++ forever
  */
-#define UART5_BASE 0xFEB80000UL
-#define UART_THR (*(volatile unsigned int *)(UART5_BASE + 0x00))
-#define UART_LSR (*(volatile unsigned int *)(UART5_BASE + 0x14))
+#define UART2_BASE 0xFEB50000UL
+#define UART_THR (*(volatile unsigned int *)(UART2_BASE + 0x00))
+#define UART_LSR (*(volatile unsigned int *)(UART2_BASE + 0x14))
 #define LSR_THRE (1u << 5)
 
 #define HB_MAGIC (*(volatile unsigned int *)(0x30000800UL))

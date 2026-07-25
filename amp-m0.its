@@ -1,0 +1,83 @@
+/*
+ * RK3588 EVB7 V11 AMP FIT (amp.img) - A55 NuttX (cpu_l3) + PMU M0, coexisting.
+ *
+ * Build (run from this dir so ./nuttx.bin and ./m0/m0.bin resolve):
+ *   <u-boot>/tools/mkimage -f amp-m0.its -E -p 0xe00 amp.img
+ *
+ * - amp1: NuttX on cpu_l3 (A55, MPIDR 0x300), unchanged, brought up via PSCI.
+ * - mcu : minimal PMU M0 heartbeat, type=standalone, released by u-boot's
+ *         fit_standalone_ext_release() (SIP 0x82000028 code-start + reset).
+ *         Loads into mcu_reserved (0x07a00000, no-map, 2MB).
+ */
+/dts-v1/;
+/ {
+	description = "RK3588 EVB7 V11 AMP FIT: A55 NuttX + PMU M0";
+	#address-cells = <1>;
+
+	images {
+		amp1 {
+			description = "nuttx-cpu3";
+			data        = /incbin/("./nuttx.bin");
+			type        = "firmware";
+			compression = "none";
+			arch        = "arm64";
+			cpu         = <0x300>;      /* cpu_l3 MPIDR */
+			thumb       = <0>;
+			hyp         = <0>;          /* EL1 */
+			load        = <0x30000000>; /* dedicated AMP core region */
+			udelay      = <1000000>;
+			hash { algo = "sha256"; };
+		};
+
+		mcu {
+			description = "pmu-m0";
+			data        = /incbin/("./m0/m0.bin");
+			type        = "standalone"; /* -> standalone_handler */
+			compression = "none";
+			arch        = "arm";        /* Cortex-M0 / ARMv6-M */
+			thumb       = <1>;
+			load        = <0x07a00000>; /* mcu_reserved base (CODE_START) */
+
+			/*
+			 * uc_start/uc_end are REQUIRED on RK3588, not just an option.
+			 * u-boot standalone_handler() dispatches like this:
+			 *
+			 *   if (sram_start || exsram_start || experi_start ||
+			 *       uc_start || uc_end)
+			 *           fit_standalone_ext_release();   <- configures the M0
+			 *   else
+			 *           fit_standalone_release();       <- __weak stub, returns 0
+			 *
+			 * RK3588 only implements fit_standalone_ext_release() (rk3588.c).
+			 * With none of these properties set, u-boot took the else branch and
+			 * hit the empty weak stub: it printed "Handle standalone ... OK"
+			 * while never programming CODE_START and never releasing the M0
+			 * reset. Setting the uncache range routes us to the real function.
+			 *
+			 * It also marks mcu_reserved as uncached for the M0, so heartbeat
+			 * writes reach DDR and Linux sees them through /dev/mem.
+			 */
+			uc_start    = <0x07a00000>; /* mcu_reserved base  */
+			uc_end      = <0x07c00000>; /* mcu_reserved end (2MB) */
+			hash { algo = "sha256"; };
+		};
+	};
+
+	configurations {
+		default = "conf";
+		conf {
+			description = "RK3588 AMP: A55 NuttX + PMU M0";
+			rollback-index = <0x0>;
+			loadables = "amp1", "mcu";
+			/* Linux stays on cpu0; entry/addrs come from U-Boot */
+			linux {
+				description = "linux-os";
+				arch   = "arm64";
+				cpu    = <0x000>;
+				thumb  = <0>;
+				hyp    = <0>;
+				udelay = <1000000>;
+			};
+		};
+	};
+};

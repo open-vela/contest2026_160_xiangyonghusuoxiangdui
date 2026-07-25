@@ -47,6 +47,17 @@
 			load        = <0x07a00000>; /* mcu_reserved base (CODE_START) */
 			uc_start    = <0x07a00000>; /* mark the carveout uncached ... */
 			uc_end      = <0x07c00000>; /* ... and select the _ext_ path  */
+
+			/* Off-chip DDR window (soc_con11). The M0 reaches this base at
+			 * 0x60000000; note that the 0x80000000 alias of the same region
+			 * is skewed by +0x20000000 because TRM Table 9-3 subtracts
+			 * 0x60000000 on both rows. Aimed at an unused part of
+			 * mcu_reserved for now, so the window can be proven without
+			 * carving out new memory - and therefore without touching the
+			 * Linux device tree. This is where rpmsg vrings will live; the
+			 * uc_start/uc_end range above already makes it uncached.
+			 */
+			exsram_start = <0x07b00000>;
 			hash { algo = "sha256"; };
 		};
 	};

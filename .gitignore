@@ -3,3 +3,7 @@
 *.elf
 *.bin
 amp.img
+*.ko
+
+# local firmware backups (known-good images kept out of git)
+_a55_backup/

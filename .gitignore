@@ -7,3 +7,7 @@ amp.img
 
 # local firmware backups (known-good images kept out of git)
 _a55_backup/
+
+# host-side test tools (built from the .c next to them)
+amp_shm_test
+amp_shm_scan

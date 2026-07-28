@@ -40,6 +40,24 @@
  *                              NuttX side
  *   ./amp_fb_show -p           never touch rpmsg, just poll the control block
  *   ./amp_fb_show -n 10        stop after 10 frames
+ *   ./amp_fb_show -t           also forward touch events to the remote
+ *   ./amp_fb_show -t -T /dev/input/event3
+ *                              forward touch from a specific device instead of
+ *                              auto-detecting one
+ *
+ * Touch runs in the same program and over the same rpmsg endpoint as the frame
+ * signalling, for two reasons. The mechanical one: rpmsg_char binds one channel
+ * per announced name and lets a single process open it, so a second channel
+ * would need some out-of-band way to tell the two apart, which is no more
+ * robust than a cmd field. The substantive one: this is the only component that
+ * knows both the panel geometry and the touch controller's range, so the
+ * coordinate mapping and its inverse are derived from the same numbers here
+ * instead of living in two programs that can drift apart.
+ *
+ * The remote cannot take the touch hardware itself: the controller is on i2c5
+ * with its interrupt on a GPIO bank 3 pin, that bank has one interrupt line for
+ * all of its pins, and the Type-C power delivery controller's interrupt is on
+ * the same bank.
  *
  * The layout below has to match
  * boards/arm64/rk3588/evb7-amp/src/evb7_amp_shm.h in the NuttX tree.
@@ -54,11 +72,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
 #include <drm/drm.h>
+#include <linux/input.h>
 
 #define AMP_SHM_BASE       0x31000000UL
 #define AMP_SHM_SIZE       (4 * 1024 * 1024)
@@ -74,6 +95,11 @@
 #define AMP_SHM_CMD_RENDER 1
 #define AMP_SHM_CMD_READY  2
 #define AMP_SHM_CMD_ACK    3
+#define AMP_SHM_CMD_TOUCH  4
+
+#define AMP_TOUCH_DOWN     0
+#define AMP_TOUCH_MOVE     1
+#define AMP_TOUCH_UP       2
 
 struct amp_shm_ctrl {
 	uint32_t magic;
@@ -95,6 +121,22 @@ struct amp_shm_msg {
 	uint32_t seq;
 	uint32_t index;
 	uint32_t sum;
+} __attribute__((packed));
+
+/* Same 16 bytes as amp_shm_msg, read as a touch event when cmd says so. Keeping
+ * the sizes equal means the receiver reads one fixed-size message and then looks
+ * at cmd, rather than needing the length before the read.
+ */
+
+struct amp_touch_msg {
+	uint32_t cmd;
+	uint32_t seq;
+	uint16_t x;
+	uint16_t y;
+	uint8_t  id;
+	uint8_t  state;
+	uint16_t pressure;
+	uint32_t reserved;
 } __attribute__((packed));
 
 /* One CRTC driving one connector with one dumb buffer. */
@@ -122,6 +164,14 @@ static void on_signal(int sig)
 {
 	(void)sig;
 	g_stop = 1;
+}
+
+static uint64_t now_ms(void)
+{
+	struct timespec tv;
+
+	clock_gettime(CLOCK_MONOTONIC, &tv);
+	return (uint64_t)tv.tv_sec * 1000 + tv.tv_nsec / 1000000;
 }
 
 /*
@@ -497,20 +547,540 @@ static void blit_scaled(struct display *d, const volatile uint32_t *src,
 }
 
 /****************************************************************************
+ * Touch
+ ****************************************************************************/
+
+/* Contacts tracked at once. The panel's controller is configured for five in
+ * the device tree; the extra slots cost nothing and keep a controller that
+ * reports more from writing past the array.
+ */
+
+#define AMP_TOUCH_SLOTS 10
+
+/* One tracked contact.
+ *
+ * "present" is what the device last said; "reported" is what the remote has been
+ * told. Keeping the two apart is what makes the decoding idempotent: this board's
+ * driver repeats a contact's tracking id and position in every report while a
+ * finger rests, and deriving "down" from the arrival of a tracking id turns a
+ * single tap into hundreds of down events with no release. Down is a transition
+ * from not-present to present, which can only happen once per contact.
+ */
+
+struct touch_slot {
+	int32_t x;                   /* last position the device gave      */
+	int32_t y;
+	int32_t sent_x;              /* last position the remote was told  */
+	int32_t sent_y;
+	bool present;                /* device says this contact exists    */
+	bool reported;               /* a down was sent and no up yet      */
+	bool seen;                   /* appeared in the frame being built  */
+	uint32_t moves;
+	uint16_t down_x;
+	uint16_t down_y;
+};
+
+/* Fields of the contact currently being assembled, for the older protocol where
+ * contacts are separated by SYN_MT_REPORT rather than addressed by slot.
+ */
+
+struct touch_group {
+	int32_t id;
+	int32_t x;
+	int32_t y;
+	bool has_id;
+	bool has_pos;
+};
+
+struct touch_src {
+	int fd;
+	char name[80];
+	bool mt;                     /* has ABS_MT_* axes at all           */
+	bool proto_a;                /* contacts separated by SYN_MT_REPORT */
+	int cur_slot;
+	int32_t min_x;
+	int32_t max_x;
+	int32_t min_y;
+	int32_t max_y;
+	struct touch_slot slot[AMP_TOUCH_SLOTS];
+	struct touch_group group;
+	uint32_t seq;
+};
+
+static bool bit_set(const unsigned long *bits, unsigned int bit)
+{
+	return (bits[bit / (8 * sizeof(long))] >>
+		(bit % (8 * sizeof(long)))) & 1UL;
+}
+
+/*
+ * Decide whether a device is the touch panel, and learn its coordinate range
+ * while we are at it.
+ *
+ * Asking the device rather than being told which node it is matters here: the
+ * board's device tree declares two different touch controllers on the same bus
+ * sharing the same interrupt and reset pins, so which one probes - and therefore
+ * what the event node number is - is not knowable from the source tree.
+ */
+static int touch_probe(struct touch_src *ts, const char *path, bool verbose)
+{
+	unsigned long abs_bits[(ABS_CNT + 8 * sizeof(long) - 1) /
+			       (8 * sizeof(long))];
+	unsigned long key_bits[(KEY_CNT + 8 * sizeof(long) - 1) /
+			       (8 * sizeof(long))];
+	struct input_absinfo absinfo;
+	int fd;
+	int axis_x;
+	int axis_y;
+
+	fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+
+	memset(abs_bits, 0, sizeof(abs_bits));
+	memset(key_bits, 0, sizeof(key_bits));
+	ioctl(fd, EVIOCGBIT(EV_ABS, sizeof(abs_bits)), abs_bits);
+	ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(key_bits)), key_bits);
+
+	if (bit_set(abs_bits, ABS_MT_POSITION_X) &&
+	    bit_set(abs_bits, ABS_MT_POSITION_Y)) {
+		ts->mt = true;
+		axis_x = ABS_MT_POSITION_X;
+		axis_y = ABS_MT_POSITION_Y;
+	} else if (bit_set(abs_bits, ABS_X) && bit_set(abs_bits, ABS_Y) &&
+		   bit_set(key_bits, BTN_TOUCH)) {
+		ts->mt = false;
+		axis_x = ABS_X;
+		axis_y = ABS_Y;
+	} else {
+		close(fd);
+		return -1;
+	}
+
+	memset(&absinfo, 0, sizeof(absinfo));
+	if (ioctl(fd, EVIOCGABS(axis_x), &absinfo) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	ts->min_x = absinfo.minimum;
+	ts->max_x = absinfo.maximum;
+
+	memset(&absinfo, 0, sizeof(absinfo));
+	if (ioctl(fd, EVIOCGABS(axis_y), &absinfo) < 0) {
+		close(fd);
+		return -1;
+	}
+
+	ts->min_y = absinfo.minimum;
+	ts->max_y = absinfo.maximum;
+
+	/* A range of zero would make the scaling below divide by zero, and it
+	 * also means the driver never filled the axis in - not a usable device.
+	 */
+
+	if (ts->max_x <= ts->min_x || ts->max_y <= ts->min_y) {
+		if (verbose)
+			fprintf(stderr,
+				"%s: unusable axis range x[%d,%d] y[%d,%d]\n",
+				path, ts->min_x, ts->max_x, ts->min_y,
+				ts->max_y);
+		close(fd);
+		return -1;
+	}
+
+	ts->name[0] = '\0';
+	ioctl(fd, EVIOCGNAME(sizeof(ts->name) - 1), ts->name);
+
+	ts->fd = fd;
+	ts->cur_slot = 0;
+	return 0;
+}
+
+static int touch_open(struct touch_src *ts, const char *want)
+{
+	struct dirent *ent;
+	DIR *dir;
+	int ret = -1;
+
+	memset(ts, 0, sizeof(*ts));
+	ts->fd = -1;
+
+	if (want != NULL) {
+		if (touch_probe(ts, want, true) < 0) {
+			fprintf(stderr,
+				"%s: not a usable touch device (needs absolute"
+				" axes with a real range)\n", want);
+			return -1;
+		}
+
+		printf("touch: %s \"%s\", %s, x[%d,%d] y[%d,%d]\n",
+		       want, ts->name, ts->mt ? "multitouch" : "single touch",
+		       ts->min_x, ts->max_x, ts->min_y, ts->max_y);
+		return 0;
+	}
+
+	dir = opendir("/dev/input");
+	if (dir == NULL) {
+		perror("opendir /dev/input");
+		return -1;
+	}
+
+	while ((ent = readdir(dir)) != NULL) {
+		char path[sizeof("/dev/input/") + sizeof(ent->d_name)];
+
+		if (strncmp(ent->d_name, "event", 5) != 0)
+			continue;
+
+		snprintf(path, sizeof(path), "/dev/input/%s", ent->d_name);
+
+		if (touch_probe(ts, path, false) < 0)
+			continue;
+
+		printf("touch: %s \"%s\", %s, x[%d,%d] y[%d,%d]\n",
+		       path, ts->name,
+		       ts->mt ? "multitouch" : "single touch",
+		       ts->min_x, ts->max_x, ts->min_y, ts->max_y);
+		ret = 0;
+		break;
+	}
+
+	closedir(dir);
+
+	if (ret < 0)
+		fprintf(stderr,
+			"no touch device found under /dev/input - pass one with"
+			" -T, or check /proc/bus/input/devices\n");
+
+	return ret;
+}
+
+/*
+ * Raw controller coordinates to the remote's framebuffer coordinates.
+ *
+ * This is the inverse of the scaling the blit does, and it lives in the same
+ * program for that reason: the remote is fixed at half the panel's resolution,
+ * so a touch at the middle of the glass has to land at the middle of a 540x960
+ * buffer, and the two conversions have to agree. The remote is told framebuffer
+ * coordinates so it never has to know a panel or a controller exists.
+ */
+static void touch_scale(const struct touch_src *ts, int32_t rx, int32_t ry,
+			uint32_t fb_w, uint32_t fb_h,
+			uint16_t *x, uint16_t *y)
+{
+	int64_t sx = (int64_t)(rx - ts->min_x) * fb_w /
+		     (ts->max_x - ts->min_x + 1);
+	int64_t sy = (int64_t)(ry - ts->min_y) * fb_h /
+		     (ts->max_y - ts->min_y + 1);
+
+	if (sx < 0)
+		sx = 0;
+	if (sy < 0)
+		sy = 0;
+	if (sx > (int64_t)fb_w - 1)
+		sx = fb_w - 1;
+	if (sy > (int64_t)fb_h - 1)
+		sy = fb_h - 1;
+
+	*x = (uint16_t)sx;
+	*y = (uint16_t)sy;
+}
+
+static void touch_send(struct touch_src *ts, int rpfd, uint8_t id,
+		       uint8_t state, uint16_t x, uint16_t y)
+{
+	struct amp_touch_msg msg;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.cmd = AMP_SHM_CMD_TOUCH;
+	msg.seq = ++ts->seq;
+	msg.x = x;
+	msg.y = y;
+	msg.id = id;
+	msg.state = state;
+
+	if (write(rpfd, &msg, sizeof(msg)) != sizeof(msg))
+		perror("write touch event");
+}
+
+/*
+ * Commit the contact being assembled, for the older protocol.
+ *
+ * The tracking id is used as the contact's identity when the device supplies one
+ * - this board's driver does - so a finger keeps the same id across reports even
+ * though the protocol has no slots. Without an id there is nothing better than
+ * the position within the report, which is only stable while the number of
+ * contacts does not change.
+ */
+static void touch_group_commit(struct touch_src *ts)
+{
+	struct touch_group *g = &ts->group;
+	struct touch_slot *s;
+	int key;
+	int i;
+
+	if (!g->has_pos) {
+		/* An empty group is how "no contacts" is spelled. Nothing to
+		 * commit; the frame-end sweep turns it into a release.
+		 */
+
+		memset(g, 0, sizeof(*g));
+		return;
+	}
+
+	if (g->has_id && g->id >= 0 && g->id < AMP_TOUCH_SLOTS) {
+		key = g->id;
+	} else {
+		key = -1;
+		for (i = 0; i < AMP_TOUCH_SLOTS; i++) {
+			if (!ts->slot[i].seen) {
+				key = i;
+				break;
+			}
+		}
+
+		if (key < 0) {
+			memset(g, 0, sizeof(*g));
+			return;
+		}
+	}
+
+	s = &ts->slot[key];
+	s->x = g->x;
+	s->y = g->y;
+	s->present = true;
+	s->seen = true;
+
+	memset(g, 0, sizeof(*g));
+}
+
+/*
+ * Turn one completed report into messages.
+ *
+ * Everything is derived from a transition rather than from an event arriving:
+ * not-present to present is a down, present with a new position is a move,
+ * present to not-present is an up. That is what makes a driver which repeats the
+ * full state every report - as this board's does - produce one down per tap
+ * instead of one per report, and it is also why a resting finger generates no
+ * traffic at all.
+ *
+ * Order is down, then move, then up. A consumer that sees an up before the down
+ * of the same contact cannot reconstruct a tap, and the release carries the last
+ * known position for the same reason: "a contact ended" without a location
+ * cannot be turned into a click.
+ *
+ * Only the start and end of a contact are logged, with the move count folded
+ * into the release line. A line per move would push a hundred lines a second
+ * onto a serial console that the remote also logs to, drowning out everything
+ * else at the exact moment there is something to watch.
+ */
+static void touch_flush(struct touch_src *ts, int rpfd, uint32_t fb_w,
+			uint32_t fb_h, bool verbose)
+{
+	int i;
+
+	/* In the older protocol a contact exists only if it was listed in this
+	 * report, so anything not seen has been released. The slot protocol is
+	 * the opposite - state persists until a tracking id is cleared - so the
+	 * sweep must not run there.
+	 */
+
+	if (ts->proto_a) {
+		for (i = 0; i < AMP_TOUCH_SLOTS; i++) {
+			if (!ts->slot[i].seen)
+				ts->slot[i].present = false;
+		}
+	}
+
+	for (i = 0; i < AMP_TOUCH_SLOTS; i++) {
+		struct touch_slot *s = &ts->slot[i];
+		uint16_t x;
+		uint16_t y;
+
+		s->seen = false;
+
+		if (!s->present && !s->reported)
+			continue;
+
+		touch_scale(ts, s->x, s->y, fb_w, fb_h, &x, &y);
+
+		if (s->present && !s->reported) {
+			touch_send(ts, rpfd, i, AMP_TOUCH_DOWN, x, y);
+			s->reported = true;
+			s->sent_x = s->x;
+			s->sent_y = s->y;
+			s->moves = 0;
+			s->down_x = x;
+			s->down_y = y;
+
+			if (verbose)
+				printf("touch id %d down (%u,%u)\n", i, x, y);
+		} else if (s->present) {
+			if (s->x == s->sent_x && s->y == s->sent_y)
+				continue;
+
+			touch_send(ts, rpfd, i, AMP_TOUCH_MOVE, x, y);
+			s->sent_x = s->x;
+			s->sent_y = s->y;
+			s->moves++;
+		} else {
+			touch_send(ts, rpfd, i, AMP_TOUCH_UP, x, y);
+			s->reported = false;
+
+			if (verbose)
+				printf("touch id %d up (%u,%u) from (%u,%u)"
+				       " after %u move(s)\n", i, x, y,
+				       s->down_x, s->down_y, s->moves);
+		}
+	}
+}
+
+/*
+ * Drain the event device.
+ *
+ * Both multitouch protocols are decoded, and which one is in use is discovered at
+ * runtime rather than from the device's capability bits. That is not caution for
+ * its own sake: this board's driver calls input_mt_init_slots() unconditionally,
+ * so ABS_MT_SLOT appears in the capability bitmap even when the driver is
+ * reporting with SYN_MT_REPORT. The usual "advertises ABS_MT_SLOT, therefore uses
+ * slots" inference is simply wrong here. Seeing a SYN_MT_REPORT is proof; the
+ * bitmap is not.
+ */
+static void touch_drain(struct touch_src *ts, int rpfd, uint32_t fb_w,
+			uint32_t fb_h, bool verbose)
+{
+	struct input_event ev[64];
+	ssize_t n;
+	size_t i;
+
+	while ((n = read(ts->fd, ev, sizeof(ev))) > 0) {
+		for (i = 0; i < (size_t)n / sizeof(ev[0]); i++) {
+			struct touch_slot *s = &ts->slot[ts->cur_slot];
+
+			switch (ev[i].type) {
+			case EV_ABS:
+				switch (ev[i].code) {
+				case ABS_MT_SLOT:
+					if (ev[i].value >= 0 &&
+					    ev[i].value < AMP_TOUCH_SLOTS)
+						ts->cur_slot = ev[i].value;
+					break;
+
+				case ABS_MT_TRACKING_ID:
+					if (ts->proto_a) {
+						ts->group.id = ev[i].value;
+						ts->group.has_id =
+							ev[i].value >= 0;
+						break;
+					}
+
+					if (ev[i].value >= 0) {
+						s->present = true;
+						s->seen = true;
+					} else {
+						s->present = false;
+					}
+					break;
+
+				case ABS_MT_POSITION_X:
+					if (ts->proto_a) {
+						ts->group.x = ev[i].value;
+						ts->group.has_pos = true;
+					} else {
+						s->x = ev[i].value;
+						s->seen = true;
+					}
+					break;
+
+				case ABS_MT_POSITION_Y:
+					if (ts->proto_a) {
+						ts->group.y = ev[i].value;
+						ts->group.has_pos = true;
+					} else {
+						s->y = ev[i].value;
+						s->seen = true;
+					}
+					break;
+
+				case ABS_X:
+					if (!ts->mt)
+						ts->slot[0].x = ev[i].value;
+					break;
+
+				case ABS_Y:
+					if (!ts->mt)
+						ts->slot[0].y = ev[i].value;
+					break;
+
+				default:
+					break;
+				}
+				break;
+
+			case EV_KEY:
+
+				/* BTN_TOUCH is only load-bearing on a device
+				 * with no multitouch axes. The older protocol
+				 * sends it too, but there the presence of a
+				 * contact is already decided by whether it was
+				 * listed in the report, and trusting both would
+				 * make a two-finger release ambiguous.
+				 */
+
+				if (ev[i].code != BTN_TOUCH || ts->mt)
+					break;
+
+				ts->slot[0].present = ev[i].value != 0;
+				break;
+
+			case EV_SYN:
+				if (ev[i].code == SYN_MT_REPORT) {
+					ts->proto_a = true;
+					touch_group_commit(ts);
+				} else if (ev[i].code == SYN_REPORT) {
+					/* The current slot is deliberately not
+					 * reset here. In the slot protocol the
+					 * kernel only emits ABS_MT_SLOT when it
+					 * changes, so a contact on slot 1 keeps
+					 * reporting without repeating the slot
+					 * number; resetting to 0 each report
+					 * would attribute those positions to the
+					 * wrong finger.
+					 */
+
+					touch_flush(ts, rpfd, fb_w, fb_h,
+						    verbose);
+				}
+				break;
+
+			default:
+				break;
+			}
+		}
+	}
+
+	if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+		perror("read touch device");
+}
+
+/****************************************************************************
  * Main
  ****************************************************************************/
 
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"usage: %s [-d card] [-r ms] [-n frames] [-p] [-q]\n"
+		"usage: %s [-d card] [-r ms] [-n frames] [-p] [-q] [-t]"
+		" [-T dev]\n"
 		"  -d card    DRM device (default /dev/dri/card0)\n"
 		"  -r ms      also request a frame from the remote every ms\n"
 		"  -n frames  stop after this many frames (default: run until"
 		" interrupted)\n"
 		"  -p         passive: poll the control block, never open"
 		" /dev/rpmsg0\n"
-		"  -q         one line per frame instead of per-frame detail\n",
+		"  -q         one line per frame instead of per-frame detail\n"
+		"  -t         forward touch events to the remote\n"
+		"  -T dev     touch event device (default: auto-detect)\n",
 		prog);
 }
 
@@ -527,12 +1097,19 @@ int main(int argc, char **argv)
 	long limit = 0;
 	bool passive = false;
 	bool quiet = false;
+	bool want_touch = false;
+	const char *touch_dev = NULL;
+	struct touch_src ts;
 	long shown = 0;
 	uint32_t last_seq;
+	uint64_t next_request;
 	int opt;
 	int ret = EXIT_FAILURE;
 
-	while ((opt = getopt(argc, argv, "d:r:n:pqh")) != -1) {
+	memset(&ts, 0, sizeof(ts));
+	ts.fd = -1;
+
+	while ((opt = getopt(argc, argv, "d:r:n:pqtT:h")) != -1) {
 		switch (opt) {
 		case 'd':
 			card = optarg;
@@ -549,10 +1126,26 @@ int main(int argc, char **argv)
 		case 'q':
 			quiet = true;
 			break;
+		case 't':
+			want_touch = true;
+			break;
+		case 'T':
+			touch_dev = optarg;
+			want_touch = true;
+			break;
 		default:
 			usage(argv[0]);
 			return EXIT_FAILURE;
 		}
+	}
+
+	/* Touch needs the rpmsg channel; there is nowhere else to send it. */
+
+	if (want_touch && passive) {
+		fprintf(stderr,
+			"-t needs the rpmsg channel, so it cannot be combined"
+			" with -p\n");
+		return EXIT_FAILURE;
 	}
 
 	signal(SIGINT, on_signal);
@@ -637,6 +1230,18 @@ int main(int argc, char **argv)
 				" block\n", rpmsg_dev, strerror(errno));
 	}
 
+	if (want_touch) {
+		if (rpfd < 0) {
+			fprintf(stderr,
+				"touch has nowhere to go without %s - is"
+				" rpmsg_char loaded?\n", rpmsg_dev);
+			goto out;
+		}
+
+		if (touch_open(&ts, touch_dev) < 0)
+			goto out;
+	}
+
 	/* Show whatever is already there, so a still frame drawn before this
 	 * program started is not invisible until the next update.
 	 */
@@ -651,28 +1256,63 @@ int main(int argc, char **argv)
 		       ctrl->ready_index);
 	}
 
+	next_request = now_ms();
+
 	while (!g_stop && (limit == 0 || shown < limit)) {
 		uint32_t seq;
 		uint32_t index;
 		uint32_t remote_sum;
 		uint32_t local_sum;
 
-		if (request_ms > 0 && rpfd >= 0) {
-			struct amp_shm_msg req = {
-				.cmd = AMP_SHM_CMD_RENDER,
-			};
-
-			if (write(rpfd, &req, sizeof(req)) != sizeof(req))
-				perror("write render request");
-		}
-
 		if (rpfd >= 0) {
-			struct pollfd pfd = { .fd = rpfd, .events = POLLIN };
+			struct pollfd pfd[2];
 			struct amp_shm_msg msg;
-			int timeout = request_ms > 0 ? request_ms : 1000;
+			int rp_i;
+			int ts_i = -1;
+			int nfds = 0;
+			int timeout;
+			uint64_t t;
 			int n;
 
-			n = poll(&pfd, 1, timeout);
+			/* Render requests are paced by the clock, not by loop
+			 * iterations. The loop now also wakes for touch events,
+			 * and asking for a frame on every wakeup would flood the
+			 * remote the moment a finger moves.
+			 */
+
+			if (request_ms > 0) {
+				t = now_ms();
+
+				if (t >= next_request) {
+					struct amp_shm_msg req = {
+						.cmd = AMP_SHM_CMD_RENDER,
+					};
+
+					if (write(rpfd, &req, sizeof(req)) !=
+					    sizeof(req))
+						perror("write render request");
+
+					next_request = t + request_ms;
+				}
+
+				t = now_ms();
+				timeout = next_request > t ?
+					  (int)(next_request - t) : 0;
+			} else {
+				timeout = 1000;
+			}
+
+			pfd[nfds].fd = rpfd;
+			pfd[nfds].events = POLLIN;
+			rp_i = nfds++;
+
+			if (ts.fd >= 0) {
+				pfd[nfds].fd = ts.fd;
+				pfd[nfds].events = POLLIN;
+				ts_i = nfds++;
+			}
+
+			n = poll(pfd, nfds, timeout);
 			if (n < 0) {
 				if (errno == EINTR)
 					continue;
@@ -680,7 +1320,11 @@ int main(int argc, char **argv)
 				goto out;
 			}
 
-			if (n == 0)
+			if (ts_i >= 0 && (pfd[ts_i].revents & POLLIN))
+				touch_drain(&ts, rpfd, ctrl->width,
+					    ctrl->height, !quiet);
+
+			if (!(pfd[rp_i].revents & POLLIN))
 				continue;
 
 			if (read(rpfd, &msg, sizeof(msg)) != sizeof(msg))
@@ -757,6 +1401,9 @@ int main(int argc, char **argv)
 	ret = EXIT_SUCCESS;
 
 out:
+	if (ts.fd >= 0)
+		close(ts.fd);
+
 	if (rpfd >= 0)
 		close(rpfd);
 

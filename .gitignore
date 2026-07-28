@@ -11,3 +11,4 @@ _a55_backup/
 # host-side test tools (built from the .c next to them)
 amp_shm_test
 amp_shm_scan
+amp_fb_show

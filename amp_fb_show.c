@@ -96,6 +96,7 @@
 #define AMP_SHM_CMD_READY  2
 #define AMP_SHM_CMD_ACK    3
 #define AMP_SHM_CMD_TOUCH  4
+#define AMP_SHM_CMD_HELLO  5
 
 #define AMP_TOUCH_DOWN     0
 #define AMP_TOUCH_MOVE     1
@@ -521,28 +522,73 @@ static void display_cleanup(struct display *d)
  * 2x, but the ratio is computed rather than assumed so a different mode still
  * produces a picture instead of a crash.
  *
+ * Every access to the shared buffer goes through two staging rows in ordinary
+ * memory, and that is the whole point rather than tidiness. The shared area is
+ * mapped uncached, so reading it one pixel at a time costs a DRAM round trip per
+ * pixel with nothing cached to amortise it - and scaling up by two reads each
+ * source pixel four times. Pulling a source row across with a single memcpy uses
+ * wide loads and touches each source byte once; the scaling then reads from
+ * ordinary cached memory, and the result goes out to the framebuffer as one
+ * sequential write per row.
+ *
  * Fixed point, 16 fractional bits: at these sizes the step fits comfortably and
  * there is no rounding drift across a row.
  */
 static void blit_scaled(struct display *d, const volatile uint32_t *src,
 			uint32_t src_w, uint32_t src_h, uint32_t src_stride)
 {
+	static uint32_t *srcrow;
+	static uint32_t *dstrow;
+	static size_t srcrow_len;
+	static size_t dstrow_len;
 	uint32_t x_step = (src_w << 16) / d->width;
 	uint32_t y_step = (src_h << 16) / d->height;
 	uint32_t src_words = src_stride / 4;
+	uint32_t cached_y = UINT32_MAX;
 	uint32_t y;
 
-	for (y = 0; y < d->height; y++) {
-		const volatile uint32_t *srow =
-			src + ((y * y_step) >> 16) * src_words;
-		uint32_t *drow = (uint32_t *)(d->map + (size_t)y * d->pitch);
-		uint32_t xacc = 0;
-		uint32_t x;
+	if (srcrow_len < src_stride) {
+		free(srcrow);
+		srcrow = malloc(src_stride);
+		srcrow_len = srcrow ? src_stride : 0;
+	}
 
-		for (x = 0; x < d->width; x++) {
-			drow[x] = srow[xacc >> 16];
-			xacc += x_step;
+	if (dstrow_len < (size_t)d->width * 4) {
+		free(dstrow);
+		dstrow = malloc((size_t)d->width * 4);
+		dstrow_len = dstrow ? (size_t)d->width * 4 : 0;
+	}
+
+	if (srcrow == NULL || dstrow == NULL) {
+		fprintf(stderr, "out of memory for scaling buffers\n");
+		return;
+	}
+
+	for (y = 0; y < d->height; y++) {
+		uint32_t sy = (y * y_step) >> 16;
+
+		/* Scaling up means consecutive output rows often come from the
+		 * same input row. Expanding it once and reusing the result keeps
+		 * the uncached reads down to one pass over the source.
+		 */
+
+		if (sy != cached_y) {
+			uint32_t xacc = 0;
+			uint32_t x;
+
+			memcpy(srcrow, (const void *)(src + (size_t)sy *
+						      src_words), src_stride);
+
+			for (x = 0; x < d->width; x++) {
+				dstrow[x] = srcrow[xacc >> 16];
+				xacc += x_step;
+			}
+
+			cached_y = sy;
 		}
+
+		memcpy(d->map + (size_t)y * d->pitch, dstrow,
+		       (size_t)d->width * 4);
 	}
 }
 
@@ -1101,8 +1147,26 @@ int main(int argc, char **argv)
 	const char *touch_dev = NULL;
 	struct touch_src ts;
 	long shown = 0;
+	long shown_at_report = 0;
 	uint32_t last_seq;
 	uint64_t next_request;
+	uint64_t next_report = 0;
+	uint64_t report_at = 0;
+
+	/* Where the frame time goes, split between the two sides.
+	 *
+	 * blit_ms is what this program spends scaling a frame onto the screen;
+	 * wait_ms is what it spends with nothing to do, waiting for the remote to
+	 * announce the next one. Both sides draw into non-cacheable memory pixel
+	 * by pixel, so both are plausible causes of a slow frame rate, and the fix
+	 * for one is a rewrite here while the fix for the other is a new buffer in
+	 * the remote's framebuffer driver. Measuring which is which is cheaper than
+	 * guessing, and much cheaper than reflashing to test a guess.
+	 */
+
+	uint64_t blit_ms = 0;
+	uint64_t wait_ms = 0;
+	uint64_t frame_done = 0;
 	int opt;
 	int ret = EXIT_FAILURE;
 
@@ -1183,6 +1247,34 @@ int main(int argc, char **argv)
 	       ctrl->width, ctrl->height, ctrl->bpp, ctrl->stride,
 	       ctrl->nbuffers);
 
+	/* Open the channel and say hello before touching the display.
+	 *
+	 * The hello is not a courtesy, it is the only way the remote learns where
+	 * to send. Its rpmsg layer takes the peer address from the first message
+	 * it receives, and opening this device transmits nothing by itself - so
+	 * until something goes out from here, every frame the remote publishes is
+	 * written to the control block and never announced.
+	 *
+	 * It goes first, before the modeset, because an application on the remote
+	 * may already be drawing. Anything it announces in the meantime waits in
+	 * the channel until the loop below starts reading, instead of being lost
+	 * for want of an address.
+	 */
+
+	if (!passive) {
+		struct amp_shm_msg hello = {
+			.cmd = AMP_SHM_CMD_HELLO,
+		};
+
+		rpfd = open(rpmsg_dev, O_RDWR);
+		if (rpfd < 0)
+			fprintf(stderr,
+				"%s: %s - falling back to polling the control"
+				" block\n", rpmsg_dev, strerror(errno));
+		else if (write(rpfd, &hello, sizeof(hello)) != sizeof(hello))
+			perror("write hello");
+	}
+
 	memset(&d, 0, sizeof(d));
 	d.fd = open(card, O_RDWR | O_CLOEXEC);
 	if (d.fd < 0) {
@@ -1221,14 +1313,6 @@ int main(int argc, char **argv)
 
 	if (set_crtc(&d, d.fb_id, &d.mode, 1) < 0)
 		goto out;
-
-	if (!passive) {
-		rpfd = open(rpmsg_dev, O_RDWR);
-		if (rpfd < 0)
-			fprintf(stderr,
-				"%s: %s - falling back to polling the control"
-				" block\n", rpmsg_dev, strerror(errno));
-	}
 
 	if (want_touch) {
 		if (rpfd < 0) {
@@ -1364,20 +1448,75 @@ int main(int argc, char **argv)
 				(const volatile uint32_t *)
 					(shm + ctrl->bufoffset[index]);
 
-			/* Checksum before scaling, so a mismatch points at the
-			 * transport rather than at this program's arithmetic.
-			 * The remote recomputes the sum on every publish, which
-			 * makes this a real end-to-end check of the bytes rather
-			 * than a comparison of two cached numbers.
+			/* A zero from the remote means it did not checksum this
+			 * frame, which is what the display path does: summing
+			 * costs a full read of the buffer out of uncached memory
+			 * on each side, per frame, and that showed up directly in
+			 * the frame rate. Verification is still available through
+			 * the test pattern, which gets its sum for free while it
+			 * draws.
+			 *
+			 * When there is a sum, it is computed here before scaling,
+			 * so a mismatch points at the transport rather than at
+			 * this program's arithmetic.
 			 */
 
-			local_sum = sum_buffer(src, ctrl->bufsize);
+			uint64_t t0;
+
+			local_sum = remote_sum != 0 ?
+				    sum_buffer(src, ctrl->bufsize) : 0;
+
+			/* The wait is measured from the end of the previous
+			 * frame, so it covers the remote's whole render cycle.
+			 */
+
+			t0 = now_ms();
+			if (frame_done != 0)
+				wait_ms += t0 - frame_done;
+
 			blit_scaled(&d, src, ctrl->width, ctrl->height,
 				    ctrl->stride);
+
+			frame_done = now_ms();
+			blit_ms += frame_done - t0;
 		}
 
 		last_seq = seq;
 		shown++;
+
+		if (remote_sum == 0) {
+			/* No checksum to compare, so report a rate instead. A
+			 * line per frame would be noise on a console the remote
+			 * also logs to, and the useful number here is frames per
+			 * second - which is also the rate at which the remote's
+			 * toolkit polls its input device, so it says as much
+			 * about responsiveness as about smoothness.
+			 */
+
+			uint64_t t = now_ms();
+
+			if (!quiet && t >= next_report) {
+				long n = shown - shown_at_report;
+
+				if (report_at != 0 && n > 0)
+					printf("%.1f fps: blit %llu ms/frame,"
+					       " waiting on remote %llu"
+					       " ms/frame\n",
+					       n * 1000.0 / (t - report_at),
+					       (unsigned long long)
+						(blit_ms / n),
+					       (unsigned long long)
+						(wait_ms / n));
+
+				report_at = t;
+				shown_at_report = shown;
+				blit_ms = 0;
+				wait_ms = 0;
+				next_report = t + 2000;
+			}
+
+			continue;
+		}
 
 		if (!quiet || local_sum != remote_sum)
 			printf("frame %u buf%u: remote 0x%08x, local 0x%08x"

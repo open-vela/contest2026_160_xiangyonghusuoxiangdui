@@ -69,8 +69,20 @@
  * boards/arm64/rk3588/evb7-amp/src/evb7_amp_shm.h in the NuttX tree.
  */
 
+/* For sched_getcpu(), which the reports use to say which core the conversion
+ * actually ran on. That turned out to matter: this SoC is four A76s and four
+ * A55s minus the one given to the remote, the A55 is in-order and clocks well
+ * below the A76, and a per-pixel cost that looks impossible on a fast core is
+ * unremarkable on a slow one. Guessing which it was is how the last two
+ * diagnoses went wrong.
+ */
+
+#define _GNU_SOURCE
+
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -85,6 +97,7 @@
 #include <sys/mman.h>
 
 #include <drm/drm.h>
+#include <linux/videodev2.h>
 #include <linux/input.h>
 
 #define AMP_SHM_BASE       0x31000000UL
@@ -94,7 +107,13 @@
  */
 
 #define AMP_SHM_MAGIC      0x31424641u    /* "AFB1" */
-#define AMP_SHM_VERSION    2
+#define AMP_SHM_VERSION    4
+
+/* Version 3 added the camera blocks. The magic is unchanged because the control
+ * block below is not: same fields, same order, same offsets, so a binary built
+ * against version 2 reads every field it knows about correctly. What it does not
+ * do is consume the frames, which the version check catches.
+ */
 
 /* The first page is skipped because something outside this project writes three
  * words at its start - see the comment in evb7_amp_shm.h.
@@ -109,10 +128,120 @@
 
 #define AMP_SHM_CMD_TOUCH  4
 #define AMP_SHM_CMD_HELLO  5
+#define AMP_SHM_CMD_CAMERA 6
+#define AMP_SHM_CMD_DETECT 7
 
 #define AMP_TOUCH_DOWN     0
 #define AMP_TOUCH_MOVE     1
 #define AMP_TOUCH_UP       2
+
+/* Camera area. Written here, read by the remote - the opposite direction to the
+ * control block, which is why it is a separate block rather than extra fields:
+ * one structure with a writer on each core is a bug waiting to happen, and
+ * keeping them apart also left the control block layout untouched.
+ *
+ * The slots are 1MB and 1MB-aligned so the offsets are checkable by eye and so
+ * changing capture resolution moves nothing. The carveout is 4MB and had two
+ * pages in use, so the space costs nothing.
+ */
+
+#define AMP_SHM_HDR_SIZE     4096
+#define AMP_CAM_DESC_OFFSET  (AMP_SHM_HDR_OFFSET + AMP_SHM_HDR_SIZE)
+#define AMP_CAM_NBUFFERS     2
+#define AMP_CAM_SLOT_SIZE    0x100000
+#define AMP_CAM_BUF0_OFFSET  0x100000
+#define AMP_CAM_BUF1_OFFSET  0x200000
+
+#define AMP_CAM_DEF_WIDTH    512
+#define AMP_CAM_DEF_HEIGHT   288
+#define AMP_CAM_BPP          4         /* XRGB8888, what the remote's fb is */
+
+#define AMP_CAM_MAGIC        0x314d4143u  /* "CAM1" */
+#define AMP_CAM_VERSION      1
+
+/* Detection results, in the page after the camera descriptor. Written here,
+ * read by the remote.
+ *
+ * A third block rather than fields added to the camera descriptor, because that
+ * one is written thirty times a second and this one about ten, and because one
+ * writer per block is the rule that has kept this area debuggable.
+ *
+ * Shared memory rather than messages - unlike touch, which is also small -
+ * because a set of boxes is a snapshot. A consumer needs every box from one
+ * frame and none from another, and the count varies; messages here are a fixed
+ * sixteen bytes, so a variable-length set would need its own framing on top. The
+ * seqlock already used for frames gives the all-or-nothing read for free.
+ */
+
+#define AMP_DET_DESC_OFFSET  (AMP_CAM_DESC_OFFSET + 4096)
+#define AMP_DET_DESC_SIZE    4096
+#define AMP_DET_MAXBOX       64        /* == OBJ_NUMB_MAX_SIZE in postprocess */
+
+#define AMP_DET_MAGIC        0x31544544u  /* "DET1" */
+#define AMP_DET_VERSION      1
+
+/* Coordinates are in the published camera frame's space, not the framebuffer's
+ * and not the model's. This side knows the two ISP streams and the letterbox the
+ * model needed, so it resolves all of that; the remote knows where on screen it
+ * drew the frame, so it adds only that. Each side owns the transform it can see.
+ */
+
+struct amp_det_box {
+	uint16_t x;
+	uint16_t y;
+	uint16_t w;
+	uint16_t h;
+	uint8_t  cls;                 /* COCO class id; 0 is person */
+	uint8_t  score;               /* confidence, 0..100 */
+	uint16_t reserved;
+} __attribute__((packed));
+
+struct amp_det_desc {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t seq;
+	uint32_t count;
+	uint32_t width;
+	uint32_t height;
+	uint32_t latency_us;          /* end-to-end time for this set */
+	uint32_t reserved;
+	struct amp_det_box box[AMP_DET_MAXBOX];
+} __attribute__((packed));
+
+struct amp_det_msg {
+	uint32_t cmd;
+	uint32_t seq;
+	uint32_t count;               /* hint only; descriptor is truth */
+	uint32_t reserved;
+} __attribute__((packed));
+
+/* seq and ready are the publication protocol and the order matters. The carveout
+ * is mapped non-cacheable on the remote, which is what removes the need for cache
+ * maintenance, but non-cacheable says nothing about ordering - so pixels are
+ * written, then a barrier, then ready, then a barrier, then seq. The remote reads
+ * seq, the frame, then seq again and retries if it moved.
+ */
+
+struct amp_cam_desc {
+	uint32_t magic;
+	uint32_t version;
+	uint32_t width;
+	uint32_t height;
+	uint32_t stride;
+	uint32_t bpp;
+	uint32_t nbuffers;
+	uint32_t bufsize;
+	uint32_t bufoffset[AMP_CAM_NBUFFERS];
+	uint32_t seq;
+	uint32_t ready;
+} __attribute__((packed));
+
+struct amp_cam_msg {
+	uint32_t cmd;
+	uint32_t seq;
+	uint32_t ready;
+	uint32_t reserved;
+} __attribute__((packed));
 
 /* Geometry only. The remote publishes it so that the coordinate scaling below
  * follows whatever resolution its framebuffer actually is.
@@ -147,6 +276,37 @@ struct amp_touch_msg {
 	uint16_t pressure;
 	uint32_t reserved;
 } __attribute__((packed));
+
+/* Every message out of this program goes through here.
+ *
+ * There are two writers now: the poll loop, which forwards touch and camera
+ * notifications, and the detector thread. A sixteen-byte write() into the rpmsg
+ * character device is very likely atomic, but "very likely" is not a property to
+ * discover from a report of interleaved messages, and the lock costs nothing at
+ * the rates involved - a few hundred contacts a second at the very most, thirty
+ * frame notifications, ten doorbells.
+ *
+ * A file-scope lock rather than one threaded through touch_drain, touch_flush and
+ * touch_send as a parameter: those three exist to decode input events, and giving
+ * each of them a mutex argument would spread a concurrency concern across code
+ * that has nothing else to do with it.
+ */
+
+static pthread_mutex_t g_rplock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool rpmsg_send(int fd, const void *msg, size_t len)
+{
+	ssize_t n;
+
+	if (fd < 0)
+		return false;
+
+	pthread_mutex_lock(&g_rplock);
+	n = write(fd, msg, len);
+	pthread_mutex_unlock(&g_rplock);
+
+	return n == (ssize_t)len;
+}
 
 /* One CRTC driving one connector with one dumb buffer. */
 
@@ -745,7 +905,7 @@ static void touch_send(struct touch_src *ts, int rpfd, uint8_t id,
 	msg.id = id;
 	msg.state = state;
 
-	if (write(rpfd, &msg, sizeof(msg)) != sizeof(msg))
+	if (!rpmsg_send(rpfd, &msg, sizeof(msg)))
 		perror("write touch event");
 }
 
@@ -1013,19 +1173,1282 @@ static void touch_drain(struct touch_src *ts, int rpfd, uint32_t fb_w,
  * Main
  ****************************************************************************/
 
+/* Camera capture
+ * ---------------------------------------------------------------------------
+ * The ISP is asked for the size we want to publish, and then told what it is
+ * actually going to give - S_FMT adjusts rather than fails. Whatever comes back
+ * is resampled to the published size in the same pass that converts it, so there
+ * is one code path instead of a good case and a clamped case.
+ *
+ * That matters here rather than being defensive habit. This sensor is 3864x2192
+ * and the panel window is 512x288, which is a 7.5x reduction - right at the edge
+ * of what the ISP's scaler will do. capture.c only clamps the requested size to
+ * [32, input window] with no ratio check, so S_FMT succeeds either way and the
+ * only way to know what happened is to read the format back.
+ *
+ * NV12 in, XRGB8888 out. NV12 because it is the format every path on this ISP
+ * supports and the one every Rockchip camera pipeline uses, so it is the least
+ * likely to find a driver corner; ISP v30 cannot produce XBGR32 at all, which
+ * earlier versions could. The conversion is here rather than on the remote
+ * because this side has seven idle A55s and the remote has one core with a 33ms
+ * frame budget already fully spent - and because it means the bytes in shared
+ * memory are exactly what the remote's framebuffer wants, so that side has no
+ * format code at all.
+ */
+
+#define CAM_MAX_BUFFERS 4
+
+struct cam_buffer {
+	void *start;
+	size_t length;
+};
+
+struct camera {
+	const char *name;
+	int fd;
+	struct cam_buffer buf[CAM_MAX_BUFFERS];
+	unsigned int nbuffers;
+
+	/* Whether frames from this stream go into the carveout.
+	 *
+	 * There are two streams now. The ISP has independent main and self
+	 * paths - the interrupt handler tracks them with separate completion
+	 * bits, ISP3X_MI_MP_FRAME and ISP3X_MI_SP_FRAME, each with its own
+	 * entry in irq_ends_mask - so one sensor can feed the display at one
+	 * size and a detector at another, with the scaling done in hardware
+	 * twice rather than in software once.
+	 *
+	 * Only the display stream publishes. The second one exists to answer
+	 * whether the two can run at once at all, which is the last thing that
+	 * could still invalidate the plan, so it does the least work that still
+	 * exercises the hardware: dequeue, count, requeue.
+	 */
+
+	bool publish;
+
+	/* V4L2's own frame counter, and the gaps in it.
+	 *
+	 * This is the measurement that matters for the dual-stream question.
+	 * Frame rate alone cannot answer it: if the ISP drops one frame in ten
+	 * under bandwidth pressure, both streams still report a plausible rate
+	 * and the sequence numbers are the only place the loss shows up.
+	 */
+
+	uint32_t v4l2_seq;
+	bool v4l2_seq_valid;
+	uint32_t gaps;
+	uint32_t gap_frames;
+
+	/* What the ISP is producing */
+
+	uint32_t src_w;
+	uint32_t src_h;
+	uint32_t src_ystride;
+
+	/* What goes into shared memory */
+
+	uint32_t out_w;
+	uint32_t out_h;
+
+	volatile struct amp_cam_desc *desc;
+	volatile uint8_t *slot[AMP_CAM_NBUFFERS];
+	uint32_t next;
+	uint32_t seq;
+	uint32_t published;
+
+	/* Resampling index tables, one entry per destination pixel/row.
+	 *
+	 * Built once because the alternative was a 64-bit multiply and divide per
+	 * pixel - and the compiler cannot fold them away even in the common case
+	 * where source and destination are the same size, because it does not know
+	 * that until run time. On an A55, whose divider is not pipelined, that was
+	 * tens of cycles on every one of 147456 pixels.
+	 */
+
+	uint32_t *xmap;
+	uint32_t *ymap;
+
+	/* Ordinary cached memory to convert into, copied to the slot in one go.
+	 *
+	 * This exists because of how the carveout is mapped on this side. It is
+	 * declared no-map, so it is absent from the kernel's linear map, so
+	 * phys_mem_access_prot() (arch/arm64/mm/mmu.c:99) takes its first branch
+	 * and returns pgprot_noncached() - which on arm64 is MT_DEVICE_nGnRnE, the
+	 * strictest attribute there is: non-gathering, non-reordering, no early
+	 * write acknowledgement. Note the branch order: the O_SYNC case that would
+	 * have given MT_NORMAL_NC is unreachable for a no-map region, so opening
+	 * /dev/mem differently does not help.
+	 *
+	 * Storing pixels straight there meant 147456 individual four-byte
+	 * transactions, each waiting for the previous to reach DRAM. Converting
+	 * into cached memory and then issuing one memcpy cannot make the mapping
+	 * gather, but it does replace those with far fewer and much wider stores.
+	 *
+	 * The remote, incidentally, maps the same bytes MT_NORMAL_NC, which does
+	 * gather. Same memory, and this side got the worse attributes purely
+	 * because the region is no-map.
+	 */
+
+	uint8_t *stage;
+
+	/* And the same treatment for the source, which turned out to be where the
+	 * time actually went.
+	 *
+	 * The first attempt at this assumed the uncached writes were the problem
+	 * and moved only the destination into cached memory. Splitting the
+	 * measurement in two disproved it immediately: the conversion still took
+	 * 11.6ms writing to ordinary memory, while the bulk copy of the whole
+	 * 589KB frame into the carveout took 3.2ms. So the writes were never the
+	 * bottleneck - the reads were.
+	 *
+	 * V4L2 MMAP buffers get there through dma_mmap_attrs(), which for a
+	 * non-coherent device returns pgprot_dmacoherent() - MT_NORMAL_NC on
+	 * arm64. The conversion then took three separate byte loads per pixel out
+	 * of it, 442368 uncached accesses with no cache line to amortise any of
+	 * them. Fetching the plane once with a bulk copy turns that into one
+	 * streaming read.
+	 */
+
+	uint8_t *nv12;
+	size_t nv12len;
+
+	/* Maxima and totals both, because a maximum on its own has now sent this
+	 * diagnosis down the wrong path twice.
+	 *
+	 * A worst case says how bad one frame got; it cannot distinguish a loop
+	 * that costs ten milliseconds every time from one that costs two and was
+	 * descheduled once. Only the mean answers that, and the two together say
+	 * whether the cost is intrinsic or a hiccup.
+	 */
+
+	uint32_t fetch_us_max;
+	uint32_t convert_us_max;
+	uint32_t copy_us_max;
+
+	uint64_t fetch_us_sum;
+	uint64_t convert_us_sum;
+	uint64_t copy_us_sum;
+
+	int cpu;
+};
+
+/****************************************************************************
+ * Name: cam_probe
+ *
+ * Description:
+ *   Find the ISP capture node by asking each /dev/video* what it is, the same
+ *   way the touch device is found rather than by hardcoding a number.
+ *
+ *   Node numbering here is not stable: rkcif, rkisp and their several paths all
+ *   register video nodes, and which one lands on video0 depends on probe order.
+ *   Matching on the driver and card names is the only way that survives a kernel
+ *   or device-tree change.
+ *
+ ****************************************************************************/
+
+static int cam_probe(char *path, size_t pathlen, const char *cardwant,
+		     bool verbose)
+{
+	int best = -1;
+	int i;
+
+	for (i = 0; i < 32; i++) {
+		struct v4l2_capability cap;
+		char dev[32];
+		int fd;
+		bool is_isp;
+		bool is_want;
+
+		snprintf(dev, sizeof(dev), "/dev/video%d", i);
+		fd = open(dev, O_RDWR | O_NONBLOCK);
+		if (fd < 0)
+			continue;
+
+		memset(&cap, 0, sizeof(cap));
+		if (ioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
+			close(fd);
+			continue;
+		}
+
+		is_isp = strstr((const char *)cap.driver, "rkisp") != NULL;
+		is_want = strstr((const char *)cap.card, cardwant) != NULL;
+
+		if (verbose)
+			printf("  %s: driver \"%s\", card \"%s\"%s\n",
+			       dev, cap.driver, cap.card,
+			       (is_isp && is_want) ? "  <- using this" : "");
+
+		close(fd);
+
+		/* Which path is wanted is now the caller's choice.
+		 *
+		 * The display takes the main path: it has the scaler and the
+		 * full set of YUV formats. The detector takes the self path,
+		 * which also has a scaler and can run at a different size at the
+		 * same time - that being the whole point of having two.
+		 *
+		 * Matching on the card name rather than the node number is not
+		 * fastidiousness. On this board rkcif registers eleven nodes
+		 * before rkisp registers any, so the main path lands on
+		 * /dev/video11 and the self path on /dev/video12; both numbers
+		 * move if either driver's probe order changes.
+		 */
+
+		if (is_isp && is_want && best < 0) {
+			best = i;
+			snprintf(path, pathlen, "%s", dev);
+		}
+	}
+
+	return best;
+}
+
+/****************************************************************************
+ * Name: cam_open
+ ****************************************************************************/
+
+static int cam_open(struct camera *c, const char *name, const char *cardwant,
+		    const char *want, uint32_t req_w, uint32_t req_h,
+		    bool verbose)
+{
+	struct v4l2_format fmt;
+	struct v4l2_requestbuffers req;
+	char found[32];
+	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	unsigned int i;
+
+	memset(c, 0, sizeof(*c));
+	c->fd = -1;
+	c->name = name;
+
+	if (want == NULL) {
+		if (verbose)
+			printf("looking for the ISP %s node:\n", cardwant);
+
+		if (cam_probe(found, sizeof(found), cardwant, verbose) < 0) {
+			fprintf(stderr,
+				"no rkisp %s node found. Is the camera"
+				" pipeline enabled and the module fitted?\n",
+				cardwant);
+			return -1;
+		}
+
+		want = found;
+	}
+
+	/* Non-blocking, and that is load-bearing rather than tidiness.
+	 *
+	 * cam_drain() decides it has taken every ready frame when DQBUF answers
+	 * EAGAIN, and DQBUF only answers EAGAIN on a non-blocking descriptor - on
+	 * a blocking one it waits for the next frame instead. Open this without
+	 * the flag and the drain never returns to the poll loop: it sits there
+	 * consuming frames at the capture rate forever, which starves touch (the
+	 * loop never gets to look at the other descriptor again) and makes Ctrl-C
+	 * ineffective, because the signal only interrupts DQBUF with EINTR and
+	 * g_stop is tested one level up.
+	 *
+	 * The probing loop above already had the flag; this is the copy that
+	 * mattered and did not.
+	 */
+
+	c->fd = open(want, O_RDWR | O_NONBLOCK);
+	if (c->fd < 0) {
+		fprintf(stderr, "%s: %s\n", want, strerror(errno));
+		return -1;
+	}
+
+	memset(&fmt, 0, sizeof(fmt));
+	fmt.type = type;
+	fmt.fmt.pix_mp.width = req_w;
+	fmt.fmt.pix_mp.height = req_h;
+	fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+	fmt.fmt.pix_mp.field = V4L2_FIELD_NONE;
+
+	if (ioctl(c->fd, VIDIOC_S_FMT, &fmt) < 0) {
+		fprintf(stderr, "%s: S_FMT: %s\n", want, strerror(errno));
+		goto fail;
+	}
+
+	if (fmt.fmt.pix_mp.pixelformat != V4L2_PIX_FMT_NV12) {
+		fprintf(stderr,
+			"%s: asked for NV12, got %.4s - this program only"
+			" converts NV12\n",
+			want, (const char *)&fmt.fmt.pix_mp.pixelformat);
+		goto fail;
+	}
+
+	c->src_w = fmt.fmt.pix_mp.width;
+	c->src_h = fmt.fmt.pix_mp.height;
+	c->src_ystride = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+	if (c->src_ystride == 0)
+		c->src_ystride = c->src_w;
+
+	printf("%s [%s]: capturing NV12 %ux%u, y stride %u\n",
+	       want, c->name, c->src_w, c->src_h, c->src_ystride);
+
+	if (c->src_w != req_w || c->src_h != req_h)
+		printf("  the ISP adjusted this from the requested %ux%u\n",
+		       req_w, req_h);
+
+	memset(&req, 0, sizeof(req));
+	req.count = CAM_MAX_BUFFERS;
+	req.type = type;
+	req.memory = V4L2_MEMORY_MMAP;
+
+	if (ioctl(c->fd, VIDIOC_REQBUFS, &req) < 0) {
+		fprintf(stderr, "%s: REQBUFS: %s\n", want, strerror(errno));
+		goto fail;
+	}
+
+	if (req.count < 2) {
+		fprintf(stderr, "%s: only got %u buffers, need at least 2\n",
+			want, req.count);
+		goto fail;
+	}
+
+	c->nbuffers = req.count;
+
+	for (i = 0; i < c->nbuffers; i++) {
+		struct v4l2_buffer buf;
+		struct v4l2_plane planes[VIDEO_MAX_PLANES];
+
+		memset(&buf, 0, sizeof(buf));
+		memset(planes, 0, sizeof(planes));
+		buf.type = type;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.index = i;
+		buf.m.planes = planes;
+		buf.length = VIDEO_MAX_PLANES;
+
+		if (ioctl(c->fd, VIDIOC_QUERYBUF, &buf) < 0) {
+			fprintf(stderr, "%s: QUERYBUF %u: %s\n", want, i,
+				strerror(errno));
+			goto fail;
+		}
+
+		c->buf[i].length = buf.m.planes[0].length;
+		c->buf[i].start = mmap(NULL, c->buf[i].length,
+				       PROT_READ | PROT_WRITE, MAP_SHARED,
+				       c->fd, buf.m.planes[0].m.mem_offset);
+		if (c->buf[i].start == MAP_FAILED) {
+			fprintf(stderr, "%s: mmap buffer %u: %s\n", want, i,
+				strerror(errno));
+			c->buf[i].start = NULL;
+			goto fail;
+		}
+
+		if (ioctl(c->fd, VIDIOC_QBUF, &buf) < 0) {
+			fprintf(stderr, "%s: QBUF %u: %s\n", want, i,
+				strerror(errno));
+			goto fail;
+		}
+	}
+
+	if (ioctl(c->fd, VIDIOC_STREAMON, &type) < 0) {
+		fprintf(stderr,
+			"%s: STREAMON: %s. The pipeline is linked but not"
+			" streaming - check the sensor is fitted and its subdev"
+			" accepted a format.\n",
+			want, strerror(errno));
+		goto fail;
+	}
+
+	return 0;
+
+fail:
+	for (i = 0; i < CAM_MAX_BUFFERS; i++) {
+		if (c->buf[i].start != NULL)
+			munmap(c->buf[i].start, c->buf[i].length);
+	}
+
+	if (c->fd >= 0)
+		close(c->fd);
+
+	c->fd = -1;
+	return -1;
+}
+
+/****************************************************************************
+ * Name: cam_publish_setup
+ *
+ * Description:
+ *   Fill in the descriptor's fixed fields and hand out the slot pointers. Done
+ *   before the magic is written, so the remote cannot find the magic and then
+ *   read geometry that has not been stored yet - the same ordering the control
+ *   block uses.
+ *
+ ****************************************************************************/
+
+static int cam_publish_setup(struct camera *c, volatile uint8_t *shm,
+			     uint32_t out_w, uint32_t out_h)
+{
+	uint32_t i;
+
+	c->out_w = out_w;
+	c->out_h = out_h;
+
+	/* Exactly what the conversion reads: the Y plane, then the interleaved
+	 * chroma plane at half the height.
+	 */
+
+	bool resample = (c->src_w != out_w || c->src_h != out_h);
+
+	c->nv12len = (size_t)c->src_ystride * c->src_h * 3 / 2;
+
+	c->stage = malloc((size_t)out_w * out_h * AMP_CAM_BPP);
+	c->nv12 = malloc(c->nv12len);
+
+	/* The tables are allocated only when they are needed, and their absence is
+	 * what selects the vectorised path. A null pointer is doing double duty as
+	 * a mode flag, which is worth naming: the alternative was a separate
+	 * boolean that could disagree with whether the tables exist.
+	 */
+
+	if (resample) {
+		c->xmap = malloc(out_w * sizeof(*c->xmap));
+		c->ymap = malloc(out_h * sizeof(*c->ymap));
+	}
+
+	if (c->stage == NULL || c->nv12 == NULL ||
+	    (resample && (c->xmap == NULL || c->ymap == NULL))) {
+		fprintf(stderr, "camera: out of memory for %ux%u staging\n",
+			out_w, out_h);
+		free(c->xmap);
+		free(c->ymap);
+		free(c->stage);
+		free(c->nv12);
+		c->xmap = NULL;
+		c->ymap = NULL;
+		c->stage = NULL;
+		c->nv12 = NULL;
+		return -1;
+	}
+
+	/* Touch every page now, so the first frame is not paying for demand
+	 * paging inside a timed section. Nearly a megabyte of fresh heap is a few
+	 * hundred faults, which is exactly the sort of one-off that sets a worst
+	 * case nobody can then explain.
+	 */
+
+	memset(c->stage, 0, (size_t)out_w * out_h * AMP_CAM_BPP);
+	memset(c->nv12, 0, c->nv12len);
+
+	/* The divides happen here, once, instead of per pixel per frame. When the
+	 * ISP gave us exactly what we asked for these are the identity, which is
+	 * the common case on this board - but the table costs a few kilobytes and
+	 * removes the question.
+	 */
+
+	if (resample) {
+		for (i = 0; i < out_w; i++)
+			c->xmap[i] =
+				(uint32_t)((uint64_t)i * c->src_w / out_w);
+
+		for (i = 0; i < out_h; i++)
+			c->ymap[i] =
+				(uint32_t)((uint64_t)i * c->src_h / out_h);
+	}
+	c->desc = (volatile struct amp_cam_desc *)(shm + AMP_CAM_DESC_OFFSET);
+	c->slot[0] = shm + AMP_CAM_BUF0_OFFSET;
+	c->slot[1] = shm + AMP_CAM_BUF1_OFFSET;
+
+	c->desc->version = AMP_CAM_VERSION;
+	c->desc->width = out_w;
+	c->desc->height = out_h;
+	c->desc->stride = out_w * AMP_CAM_BPP;
+	c->desc->bpp = AMP_CAM_BPP;
+	c->desc->nbuffers = AMP_CAM_NBUFFERS;
+	c->desc->bufsize = out_w * AMP_CAM_BPP * out_h;
+	c->desc->bufoffset[0] = AMP_CAM_BUF0_OFFSET;
+	c->desc->bufoffset[1] = AMP_CAM_BUF1_OFFSET;
+	c->desc->seq = 0;
+	c->desc->ready = 0;
+
+	__sync_synchronize();
+
+	c->desc->magic = AMP_CAM_MAGIC;
+
+	__sync_synchronize();
+
+	printf("camera: publishing %ux%u XRGB8888, %u bytes per frame,"
+	       " descriptor at 0x%08lx%s\n",
+	       out_w, out_h, out_w * out_h * AMP_CAM_BPP,
+	       AMP_SHM_BASE + AMP_CAM_DESC_OFFSET,
+	       resample ? " (resampling, scalar path)" :
+	       " (no resampling, vectorised path)");
+	return 0;
+}
+
+/****************************************************************************
+ * Name: nv12_to_xrgb
+ *
+ * Description:
+ *   Convert and resample in one pass. BT.601 limited range, integer
+ *   coefficients, point sampling on both axes.
+ *
+ *   Point sampling rather than averaging because this runs per frame and the
+ *   result is a preview: the difference is visible only on fine detail, and the
+ *   cost of a box filter is four times the reads. If the picture ever needs to be
+ *   better than a preview, the right answer is the RGA doing it in hardware, not
+ *   a better loop here.
+ *
+ ****************************************************************************/
+
+static void nv12_to_xrgb(const uint8_t *src, uint32_t sh, uint32_t sstride,
+			 uint8_t *dst, uint32_t dw, uint32_t dh,
+			 const uint32_t *xmap, const uint32_t *ymap)
+{
+	const uint8_t *ysrc = src;
+	const uint8_t *uvsrc = src + (size_t)sstride * sh;
+	uint32_t dy;
+
+	for (dy = 0; dy < dh; dy++) {
+		uint32_t sy = ymap[dy];
+		const uint8_t *yrow = ysrc + (size_t)sy * sstride;
+		const uint8_t *uvrow = uvsrc + (size_t)(sy / 2) * sstride;
+		uint32_t *out = (uint32_t *)(dst + (size_t)dy * dw * 4);
+		uint32_t dx;
+
+		for (dx = 0; dx < dw; dx++) {
+			uint32_t sx = xmap[dx];
+			int c = (int)yrow[sx] - 16;
+			int d = (int)uvrow[(sx & ~1u)] - 128;
+			int e = (int)uvrow[(sx & ~1u) + 1] - 128;
+			int r = (298 * c + 409 * e + 128) >> 8;
+			int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+			int b = (298 * c + 516 * d + 128) >> 8;
+
+			if (r < 0)
+				r = 0;
+			else if (r > 255)
+				r = 255;
+
+			if (g < 0)
+				g = 0;
+			else if (g > 255)
+				g = 255;
+
+			if (b < 0)
+				b = 0;
+			else if (b > 255)
+				b = 255;
+
+			/* Opaque alpha, even though the path this frame is on
+			 * ignores it: the VOP mixer for this layer runs with the
+			 * source alpha pinned to the global 0xff, so what is in
+			 * the top byte makes no difference on screen today.
+			 *
+			 * It is set anyway because the obvious next consumer is
+			 * an LVGL image object, and LVGL at 32-bit colour does
+			 * honour per-pixel alpha when it composites one. A frame
+			 * carrying zero there would be perfectly correct in this
+			 * path and completely invisible in that one, which is a
+			 * trap worth not leaving behind for the sake of a
+			 * constant.
+			 */
+
+			out[dx] = 0xff000000u | ((uint32_t)r << 16) |
+				  ((uint32_t)g << 8) | (uint32_t)b;
+		}
+	}
+}
+
+/****************************************************************************
+ * Name: nv12_to_xrgb_1to1
+ *
+ * Description:
+ *   The same conversion with the resampling removed, for when the ISP gave
+ *   exactly the geometry that was asked for - which is what happens on this
+ *   board.
+ *
+ *   This exists because the index table above cannot be vectorised. Asking gcc
+ *   for the assembly settles it: the general loop is 46 scalar instructions per
+ *   pixel with no NEON at all, even at -O3, because reading the source through
+ *   xmap[] is a gather and the compiler cannot prove it is a linear stride. Take
+ *   the indirection out and the same arithmetic vectorises into 298 NEON
+ *   instructions covering many pixels at a time.
+ *
+ *   Which is the awkward part of the previous change: the table was introduced
+ *   to remove a 64-bit divide per pixel, and the divide was indeed removed, but
+ *   the measured cost did not move - because the divide was never what made this
+ *   loop scalar, and neither version could vectorise. The table cost nothing and
+ *   bought nothing.
+ *
+ *   Two pixels per iteration so that the chroma pair is read once and all three
+ *   source streams advance linearly; a single-pixel loop with dx & ~1 leaves the
+ *   chroma reads looking irregular enough to block vectorisation again.
+ *
+ *   The arithmetic is a duplicate of the general path and must stay bit-identical
+ *   to it. That is checked rather than hoped for: the host-side test runs both
+ *   over the same frame and compares every byte.
+ *
+ ****************************************************************************/
+
+/* noinline, and it is doing real work here rather than documenting intent.
+ *
+ * Left to itself gcc inlines both conversions into main() - the whole program
+ * collapses into four symbols - and the vectoriser then gives up on this loop.
+ * Compiled as its own function with runtime bounds it produces 334 NEON
+ * instructions; inlined into main() it produces none. The call happens once per
+ * frame, so the overhead is not measurable, and being a separate function is the
+ * thing that makes the loop vectorisable at all.
+ *
+ * This was nearly missed: a standalone probe of the same loop appeared to
+ * vectorise beautifully, but the probe called it with constant dimensions, so gcc
+ * had specialised it. The number that matters came from compiling the real file.
+ */
+
+__attribute__((noinline))
+static void nv12_to_xrgb_1to1(const uint8_t *src, uint32_t sh,
+			      uint32_t sstride, uint8_t *dst, uint32_t dw,
+			      uint32_t dh)
+{
+	const uint8_t *uvsrc = src + (size_t)sstride * sh;
+	uint32_t dy;
+
+	for (dy = 0; dy < dh; dy++) {
+		const uint8_t *yrow = src + (size_t)dy * sstride;
+		const uint8_t *uvrow = uvsrc + (size_t)(dy / 2) * sstride;
+		uint32_t *out = (uint32_t *)(dst + (size_t)dy * dw * 4);
+		uint32_t dx;
+
+		for (dx = 0; dx + 1 < dw; dx += 2) {
+			int d = (int)uvrow[dx] - 128;
+			int e = (int)uvrow[dx + 1] - 128;
+			int c0 = (int)yrow[dx] - 16;
+			int c1 = (int)yrow[dx + 1] - 16;
+			int r0 = (298 * c0 + 409 * e + 128) >> 8;
+			int g0 = (298 * c0 - 100 * d - 208 * e + 128) >> 8;
+			int b0 = (298 * c0 + 516 * d + 128) >> 8;
+			int r1 = (298 * c1 + 409 * e + 128) >> 8;
+			int g1 = (298 * c1 - 100 * d - 208 * e + 128) >> 8;
+			int b1 = (298 * c1 + 516 * d + 128) >> 8;
+
+			if (r0 < 0)
+				r0 = 0;
+			else if (r0 > 255)
+				r0 = 255;
+
+			if (g0 < 0)
+				g0 = 0;
+			else if (g0 > 255)
+				g0 = 255;
+
+			if (b0 < 0)
+				b0 = 0;
+			else if (b0 > 255)
+				b0 = 255;
+
+			if (r1 < 0)
+				r1 = 0;
+			else if (r1 > 255)
+				r1 = 255;
+
+			if (g1 < 0)
+				g1 = 0;
+			else if (g1 > 255)
+				g1 = 255;
+
+			if (b1 < 0)
+				b1 = 0;
+			else if (b1 > 255)
+				b1 = 255;
+
+			out[dx] = 0xff000000u | ((uint32_t)r0 << 16) |
+				  ((uint32_t)g0 << 8) | (uint32_t)b0;
+			out[dx + 1] = 0xff000000u | ((uint32_t)r1 << 16) |
+				      ((uint32_t)g1 << 8) | (uint32_t)b1;
+		}
+
+		/* Odd width leaves one pixel over. It shares the chroma pair with
+		 * the column to its left, exactly as the general path would.
+		 */
+
+		if (dx < dw) {
+			uint32_t ux = dx & ~1u;
+			int d = (int)uvrow[ux] - 128;
+			int e = (int)uvrow[ux + 1] - 128;
+			int c = (int)yrow[dx] - 16;
+			int r = (298 * c + 409 * e + 128) >> 8;
+			int g = (298 * c - 100 * d - 208 * e + 128) >> 8;
+			int b = (298 * c + 516 * d + 128) >> 8;
+
+			if (r < 0)
+				r = 0;
+			else if (r > 255)
+				r = 255;
+
+			if (g < 0)
+				g = 0;
+			else if (g > 255)
+				g = 255;
+
+			if (b < 0)
+				b = 0;
+			else if (b > 255)
+				b = 255;
+
+			out[dx] = 0xff000000u | ((uint32_t)r << 16) |
+				  ((uint32_t)g << 8) | (uint32_t)b;
+		}
+	}
+}
+
+/****************************************************************************
+ * Name: cam_drain
+ *
+ * Description:
+ *   Take every frame the ISP has ready, convert the newest into the next slot,
+ *   publish it and tell the remote.
+ *
+ ****************************************************************************/
+
+static void cam_drain(struct camera *c, int rpfd, bool verbose)
+{
+	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+
+	for (; ; ) {
+		struct v4l2_buffer buf;
+		struct v4l2_plane planes[VIDEO_MAX_PLANES];
+		struct amp_cam_msg msg;
+		struct timespec tf;
+		struct timespec t0;
+		struct timespec t1;
+		struct timespec t2;
+		uint32_t slot;
+		long us;
+
+		memset(&buf, 0, sizeof(buf));
+		memset(planes, 0, sizeof(planes));
+		buf.type = type;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.m.planes = planes;
+		buf.length = VIDEO_MAX_PLANES;
+
+		if (ioctl(c->fd, VIDIOC_DQBUF, &buf) < 0) {
+			if (errno == EAGAIN)
+				return;
+
+			/* Retrying on EINTR is right, but not unconditionally:
+			 * the signal that interrupted this is usually the one
+			 * asking the program to stop, and g_stop is only tested
+			 * in the loop this function has to return to first.
+			 */
+
+			if (errno == EINTR) {
+				if (g_stop)
+					return;
+
+				continue;
+			}
+
+			fprintf(stderr, "%s: DQBUF: %s\n", c->name,
+				strerror(errno));
+			return;
+		}
+
+		/* The ISP's own frame counter, checked before anything else is
+		 * done with the buffer.
+		 *
+		 * This is the measurement the dual-stream question turns on. Rate
+		 * cannot answer it: if bandwidth pressure makes the ISP drop one
+		 * frame in ten, both streams still report a believable rate and
+		 * the loss is visible only as a step in this counter.
+		 */
+
+		if (c->v4l2_seq_valid && buf.sequence != c->v4l2_seq + 1) {
+			c->gaps++;
+			c->gap_frames += buf.sequence - c->v4l2_seq - 1;
+		}
+
+		c->v4l2_seq = buf.sequence;
+		c->v4l2_seq_valid = true;
+
+		/* Count-only stream: straight back into the queue.
+		 *
+		 * Nothing is converted and nothing is published, because the
+		 * question being asked is whether the hardware can produce two
+		 * streams at once - not what the second one is worth. Doing the
+		 * least work here also means a drop measured on this stream is
+		 * the ISP's, not this program's.
+		 */
+
+		if (!c->publish) {
+			c->published++;
+
+			if (ioctl(c->fd, VIDIOC_QBUF, &buf) < 0)
+				fprintf(stderr, "%s: QBUF: %s\n", c->name,
+					strerror(errno));
+
+			continue;
+		}
+
+		slot = c->next;
+
+		clock_gettime(CLOCK_MONOTONIC, &tf);
+
+		/* One streaming read out of the capture buffer, replacing three
+		 * uncached byte loads per pixel.
+		 */
+
+		memcpy(c->nv12, c->buf[buf.index].start,
+		       c->nv12len < c->buf[buf.index].length ?
+		       c->nv12len : c->buf[buf.index].length);
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+
+		if (c->xmap == NULL)
+			nv12_to_xrgb_1to1(c->nv12, c->src_h, c->src_ystride,
+					  c->stage, c->out_w, c->out_h);
+		else
+			nv12_to_xrgb(c->nv12, c->src_h, c->src_ystride,
+				     c->stage, c->out_w, c->out_h, c->xmap,
+				     c->ymap);
+
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+
+		/* One bulk copy into the carveout. The volatile qualifier is cast
+		 * away deliberately: it is there to stop the compiler caching
+		 * individual reads and writes, and what is wanted here is exactly
+		 * the opposite - the widest stores the C library will use. The
+		 * ordering that matters is supplied by the barrier below, not by
+		 * the qualifier.
+		 */
+
+		memcpy((void *)c->slot[slot], c->stage,
+		       (size_t)c->out_w * c->out_h * AMP_CAM_BPP);
+
+		clock_gettime(CLOCK_MONOTONIC, &t2);
+
+		/* Pixels first, then the index, then the sequence number, with a
+		 * barrier between each. The carveout is non-cacheable on the
+		 * remote so no flushing is needed, but non-cacheable does not
+		 * imply ordered: without these the remote could see a new
+		 * sequence number pointing at a slot that is still half written.
+		 */
+
+		__sync_synchronize();
+
+		c->desc->ready = slot;
+
+		__sync_synchronize();
+
+		c->seq++;
+		c->desc->seq = c->seq;
+
+		__sync_synchronize();
+
+		c->next = (slot + 1) % AMP_CAM_NBUFFERS;
+		c->published++;
+
+		/* Timed apart so the measurement says which half costs what,
+		 * rather than leaving it to be guessed from one total.
+		 */
+
+		us = (t0.tv_sec - tf.tv_sec) * 1000000 +
+		     (t0.tv_nsec - tf.tv_nsec) / 1000;
+		if (us > (long)c->fetch_us_max)
+			c->fetch_us_max = (uint32_t)us;
+		c->fetch_us_sum += (uint64_t)us;
+
+		us = (t1.tv_sec - t0.tv_sec) * 1000000 +
+		     (t1.tv_nsec - t0.tv_nsec) / 1000;
+		if (us > (long)c->convert_us_max)
+			c->convert_us_max = (uint32_t)us;
+		c->convert_us_sum += (uint64_t)us;
+
+		us = (t2.tv_sec - t1.tv_sec) * 1000000 +
+		     (t2.tv_nsec - t1.tv_nsec) / 1000;
+		if (us > (long)c->copy_us_max)
+			c->copy_us_max = (uint32_t)us;
+		c->copy_us_sum += (uint64_t)us;
+
+		/* Sampled per frame rather than once, because nothing stops the
+		 * scheduler moving this between a little core and a big one.
+		 */
+
+		c->cpu = sched_getcpu();
+
+		if (ioctl(c->fd, VIDIOC_QBUF, &buf) < 0)
+			perror("QBUF");
+
+		/* The notification carries the index, but the remote reads the
+		 * descriptor rather than trusting it - so a message lost because
+		 * the rpmsg pool was busy costs one dropped frame, not a frame
+		 * torn out of the slot being written.
+		 */
+
+		if (rpfd >= 0) {
+			memset(&msg, 0, sizeof(msg));
+			msg.cmd = AMP_SHM_CMD_CAMERA;
+			msg.seq = c->seq;
+			msg.ready = slot;
+
+			if (!rpmsg_send(rpfd, &msg, sizeof(msg)) && verbose)
+				fprintf(stderr, "camera: notify seq %u: %s\n",
+					c->seq, strerror(errno));
+		}
+	}
+}
+
+/* Detection publishing
+ * ---------------------------------------------------------------------------
+ * The producer for the results block. What fills the boxes is separate from how
+ * they are published, and this is the publishing half.
+ *
+ * It runs on its own thread, which is not a preference. One inference takes
+ * 17.4ms on a single NPU core, measured; the poll loop below also forwards touch
+ * and publishes camera frames. Detecting ten times a second from inside that loop
+ * would freeze touch for 17ms out of every 100 - a sixth of the time
+ * unresponsive, which is exactly the kind of "works but feels broken" that took
+ * five attempts to find in A-15.
+ *
+ * Nothing is dynamically linked for it. The libraries the real detector needs -
+ * librknnrt and librga - will be dlopen'd when that lands, not linked, because
+ * this binary currently depends on nothing but libc and that is worth keeping:
+ * linking them would mean a system without the RKNN runtime cannot even load the
+ * program, and the display and touch paths would go down with a feature they do
+ * not use. Same reason the rpmsg open was made non-fatal.
+ */
+
+struct detector {
+	volatile struct amp_det_desc *desc;
+	pthread_t thread;
+	bool running;
+	bool stop;
+
+	/* Synthetic mode: boxes made up here rather than detected.
+	 *
+	 * This exists to test the transport on its own and it is worth keeping
+	 * afterwards. With inference in the loop a screen with no boxes has six
+	 * possible causes - RGA, the model, post-processing, this publish, the
+	 * doorbell, the remote's read - and no way to tell them apart. With
+	 * synthetic boxes there is one thing being tested, so if they appear the
+	 * whole transport is proven and anything that breaks later is in the
+	 * inference chain.
+	 */
+
+	bool synthetic;
+
+	int rpfd;
+
+	uint32_t width;
+	uint32_t height;
+	uint32_t published;
+	uint32_t notify_fail;
+};
+
+/****************************************************************************
+ * Name: det_publish
+ *
+ * Description:
+ *   Make one set of boxes visible to the remote, then ring the doorbell.
+ *
+ *   The sequence number goes odd, then the payload is written, then it goes even
+ *   again. That is a full seqlock rather than the single bump the frames use, and
+ *   the reason is that there is only one detection block: the frames are
+ *   double-buffered so a reader never touches memory being written, while this is
+ *   updated in place and a reader could otherwise copy half of each of two sets
+ *   without the sequence number ever looking wrong.
+ *
+ ****************************************************************************/
+
+static void det_publish(struct detector *d, const struct amp_det_box *box,
+			uint32_t count, uint32_t latency_us)
+{
+	struct amp_det_msg msg;
+	uint32_t i;
+	uint32_t seq;
+
+	if (d->desc == NULL || count > AMP_DET_MAXBOX)
+		return;
+
+	seq = d->desc->seq;
+
+	/* Odd: a write is in progress. Anything reading now will see this and
+	 * start over rather than take a half-updated set.
+	 */
+
+	d->desc->seq = seq + 1;
+
+	__sync_synchronize();
+
+	for (i = 0; i < count; i++) {
+		d->desc->box[i].x = box[i].x;
+		d->desc->box[i].y = box[i].y;
+		d->desc->box[i].w = box[i].w;
+		d->desc->box[i].h = box[i].h;
+		d->desc->box[i].cls = box[i].cls;
+		d->desc->box[i].score = box[i].score;
+		d->desc->box[i].reserved = 0;
+	}
+
+	d->desc->count = count;
+	d->desc->width = d->width;
+	d->desc->height = d->height;
+	d->desc->latency_us = latency_us;
+
+	__sync_synchronize();
+
+	d->desc->seq = seq + 2;
+
+	__sync_synchronize();
+
+	d->published++;
+
+	if (d->rpfd < 0)
+		return;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.cmd = AMP_SHM_CMD_DETECT;
+	msg.seq = seq + 2;
+	msg.count = count;
+
+	/* Through the same serialised path as everything else, because the poll
+	 * loop writes touch and frame notifications to this descriptor while this
+	 * thread is running.
+	 */
+
+	if (!rpmsg_send(d->rpfd, &msg, sizeof(msg)))
+		d->notify_fail++;
+}
+
+/****************************************************************************
+ * Name: det_synth
+ *
+ * Description:
+ *   Two boxes that move, so that both the transport and its latency are visible.
+ *
+ *   Moving rather than static on purpose: a static box proves bytes arrive, but a
+ *   moving one also shows how far behind the boxes are, which is the one
+ *   characteristic of this design that has to be seen to be judged. One box
+ *   sweeps horizontally and the other is fixed, so a stuck transport and a stuck
+ *   detector look different - if the sweeping box freezes while the fixed one is
+ *   still drawn, publishing stopped rather than the remote's reading.
+ *
+ ****************************************************************************/
+
+static uint32_t det_synth(struct detector *d, struct amp_det_box *box,
+			  uint32_t tick)
+{
+	uint32_t bw = d->width / 6;
+	uint32_t bh = d->height / 2;
+	uint32_t span;
+	uint32_t pos;
+
+	if (bw == 0 || bh == 0)
+		return 0;
+
+	span = d->width - bw;
+	pos = tick % (2 * span);
+	if (pos >= span)
+		pos = 2 * span - pos;   /* back and forth, not a jump */
+
+	box[0].x = (uint16_t)pos;
+	box[0].y = (uint16_t)((d->height - bh) / 2);
+	box[0].w = (uint16_t)bw;
+	box[0].h = (uint16_t)bh;
+	box[0].cls = 0;                 /* person, as a real detection would be */
+	box[0].score = (uint8_t)(60 + (tick % 40));
+	box[0].reserved = 0;
+
+	box[1].x = (uint16_t)(d->width - bw - 2);
+	box[1].y = 2;
+	box[1].w = (uint16_t)bw;
+	box[1].h = (uint16_t)(bh / 2);
+	box[1].cls = 0;
+	box[1].score = 99;
+	box[1].reserved = 0;
+
+	return 2;
+}
+
+/****************************************************************************
+ * Name: det_thread
+ ****************************************************************************/
+
+static void *det_thread(void *arg)
+{
+	struct detector *d = arg;
+	uint32_t tick = 0;
+
+	/* Ten a second, which is the rate the design assumes and roughly what one
+	 * NPU core sustains once RGA and post-processing are added. Deliberately
+	 * not the display's thirty: the boxes are allowed to lag, and making the
+	 * picture wait for a producer running at a third of its rate would be the
+	 * wrong way round.
+	 */
+
+	while (!d->stop && !g_stop) {
+		struct amp_det_box box[AMP_DET_MAXBOX];
+		struct timespec t0;
+		struct timespec t1;
+		uint32_t count = 0;
+		long us;
+
+		clock_gettime(CLOCK_MONOTONIC, &t0);
+
+		if (d->synthetic)
+			count = det_synth(d, box, tick);
+
+		clock_gettime(CLOCK_MONOTONIC, &t1);
+
+		us = (t1.tv_sec - t0.tv_sec) * 1000000 +
+		     (t1.tv_nsec - t0.tv_nsec) / 1000;
+
+		det_publish(d, box, count, (uint32_t)us);
+
+		tick++;
+		usleep(100000);
+	}
+
+	return NULL;
+}
+
+/****************************************************************************
+ * Name: det_start
+ ****************************************************************************/
+
+static int det_start(struct detector *d, volatile uint8_t *shm, uint32_t width,
+		     uint32_t height, int rpfd, bool synthetic)
+{
+	d->desc = (volatile struct amp_det_desc *)(shm + AMP_DET_DESC_OFFSET);
+	d->width = width;
+	d->height = height;
+	d->rpfd = rpfd;
+	d->synthetic = synthetic;
+	d->stop = false;
+
+	/* Geometry and an even sequence number before the magic, so the remote
+	 * cannot find the magic and then read a block that has not been set up -
+	 * the same ordering the other two blocks use.
+	 */
+
+	d->desc->version = AMP_DET_VERSION;
+	d->desc->seq = 0;
+	d->desc->count = 0;
+	d->desc->width = width;
+	d->desc->height = height;
+	d->desc->latency_us = 0;
+
+	__sync_synchronize();
+
+	d->desc->magic = AMP_DET_MAGIC;
+
+	__sync_synchronize();
+
+	if (pthread_create(&d->thread, NULL, det_thread, d) != 0) {
+		perror("pthread_create");
+		d->desc->magic = 0;
+		__sync_synchronize();
+		d->desc = NULL;
+		return -1;
+	}
+
+	d->running = true;
+
+	printf("detector: %s, publishing %ux%u boxes at 0x%08lx, up to %d per"
+	       " set\n",
+	       synthetic ? "SYNTHETIC (transport self-test, no inference)" :
+	       "inference", width, height,
+	       AMP_SHM_BASE + AMP_DET_DESC_OFFSET, AMP_DET_MAXBOX);
+
+	return 0;
+}
+
+/****************************************************************************
+ * Name: det_stop
+ ****************************************************************************/
+
+static void det_stop(struct detector *d)
+{
+	if (!d->running)
+		return;
+
+	d->stop = true;
+	pthread_join(d->thread, NULL);
+	d->running = false;
+
+	/* Clear the magic, so the remote stops believing there is a detector.
+	 * Without this a restart would leave the last set frozen on screen, which
+	 * looks exactly like a detector that has stalled.
+	 */
+
+	if (d->desc != NULL) {
+		d->desc->magic = 0;
+		__sync_synchronize();
+	}
+
+	printf("detector: %u sets published, %u doorbells failed\n",
+	       d->published, d->notify_fail);
+}
+
+/****************************************************************************
+ * Name: cam_close
+ ****************************************************************************/
+
+static void cam_close(struct camera *c)
+{
+	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	unsigned int i;
+
+	if (c->fd < 0)
+		return;
+
+	ioctl(c->fd, VIDIOC_STREAMOFF, &type);
+
+	/* Clear the magic so the remote stops believing the slots hold anything.
+	 * Without this a restart of this program would leave the last frame
+	 * frozen on screen, which looks exactly like a stalled pipeline.
+	 */
+
+	if (c->desc != NULL) {
+		c->desc->magic = 0;
+		__sync_synchronize();
+	}
+
+	for (i = 0; i < CAM_MAX_BUFFERS; i++) {
+		if (c->buf[i].start != NULL)
+			munmap(c->buf[i].start, c->buf[i].length);
+	}
+
+	free(c->xmap);
+	free(c->ymap);
+	free(c->stage);
+	free(c->nv12);
+	c->xmap = NULL;
+	c->ymap = NULL;
+	c->stage = NULL;
+	c->nv12 = NULL;
+
+	close(c->fd);
+	c->fd = -1;
+}
+
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"usage: %s [-d card] [-T dev] [-q]\n"
+		"usage: %s [-d card] [-T dev] [-q] [-C] [-V dev] [-W w] [-H h]\n"
 		"  -d card    DRM device (default /dev/dri/card0)\n"
 		"  -T dev     touch event device (default: auto-detect)\n"
 		"  -q         do not log each contact\n"
 		"  -t         accepted and ignored (touch is always on now)\n"
+		"  -C         capture from the camera and publish frames\n"
+		"  -V dev     capture node (default: find the rkisp mainpath)\n"
+		"  -W w       published frame width (default %u)\n"
+		"  -H h       published frame height (default %u)\n"
+		"  -D         also run a second ISP stream, counting only\n"
+		"  -S dev     second stream node (default: find the selfpath)\n"
+		"  -R WxH     second stream size (default 1280x720)\n"
+		"  -a         publish synthetic detections - a self-test of the\n"
+		"             results transport, with no inference at all\n"
 		"\n"
-		"Lights the panel and forwards touch to the AMP core. Keeps\n"
-		"running: exiting restores the previous CRTC configuration,\n"
-		"which takes the panel down.\n",
-		prog);
+		"Lights the panel and forwards touch to the AMP core. With -C it\n"
+		"also captures from the ISP, converts each frame to XRGB8888 and\n"
+		"publishes it in the shared carveout for the AMP core to draw.\n"
+		"Keeps running: exiting restores the previous CRTC\n"
+		"configuration, which takes the panel down.\n",
+		prog, AMP_CAM_DEF_WIDTH, AMP_CAM_DEF_HEIGHT);
 }
 
 int main(int argc, char **argv)
@@ -1036,6 +2459,21 @@ int main(int argc, char **argv)
 	volatile struct amp_shm_ctrl *ctrl;
 	volatile uint8_t *shm;
 	struct amp_shm_hdr hello = { .cmd = AMP_SHM_CMD_HELLO };
+	struct camera cam;
+	struct camera det;
+	time_t cam_last_report = 0;
+	uint32_t cam_last_count = 0;
+	uint32_t det_last_count = 0;
+	const char *cam_dev = NULL;
+	const char *det_dev = NULL;
+	uint32_t det_w = 1280;
+	uint32_t det_h = 720;
+	bool want_detect = false;
+	struct detector ai;
+	bool want_synth = false;
+	uint32_t cam_w = AMP_CAM_DEF_WIDTH;
+	uint32_t cam_h = AMP_CAM_DEF_HEIGHT;
+	bool want_camera = false;
 	int memfd;
 	int rpfd = -1;
 	bool quiet = false;
@@ -1049,7 +2487,13 @@ int main(int argc, char **argv)
 	memset(&ts, 0, sizeof(ts));
 	ts.fd = -1;
 
-	while ((opt = getopt(argc, argv, "d:T:qth")) != -1) {
+	memset(&cam, 0, sizeof(cam));
+	memset(&det, 0, sizeof(det));
+	memset(&ai, 0, sizeof(ai));
+	cam.fd = -1;
+	det.fd = -1;
+
+	while ((opt = getopt(argc, argv, "d:T:qthCV:W:H:DS:R:a")) != -1) {
 		switch (opt) {
 		case 'd':
 			card = optarg;
@@ -1060,6 +2504,69 @@ int main(int argc, char **argv)
 		case 'q':
 			quiet = true;
 			break;
+		case 'C':
+			want_camera = true;
+			break;
+		case 'V':
+			cam_dev = optarg;
+			want_camera = true;
+			break;
+		case 'W':
+			cam_w = (uint32_t)strtoul(optarg, NULL, 0);
+			want_camera = true;
+			break;
+		case 'H':
+			cam_h = (uint32_t)strtoul(optarg, NULL, 0);
+			want_camera = true;
+			break;
+		case 'D':
+			want_detect = true;
+			want_camera = true;
+			break;
+		case 'a':
+
+			/* Synthetic detections. Needs the camera because the
+			 * boxes are in the published frame's coordinate space
+			 * and there is nothing to draw them over otherwise, but
+			 * deliberately does not need the second ISP stream:
+			 * this tests the results transport, nothing else.
+			 */
+
+			want_synth = true;
+			want_camera = true;
+			break;
+		case 'S':
+			det_dev = optarg;
+			want_detect = true;
+			want_camera = true;
+			break;
+		case 'R': {
+			/* "WxH", parsed strictly. A size that silently became
+			 * something else would make the whole measurement
+			 * meaningless while still producing numbers.
+			 */
+			unsigned long w;
+			unsigned long h;
+			char *end;
+
+			w = strtoul(optarg, &end, 10);
+			if (*end != 'x' || w == 0) {
+				fprintf(stderr, "-R wants WxH, e.g. 1280x720\n");
+				return EXIT_FAILURE;
+			}
+
+			h = strtoul(end + 1, &end, 10);
+			if (*end != '\0' || h == 0) {
+				fprintf(stderr, "-R wants WxH, e.g. 1280x720\n");
+				return EXIT_FAILURE;
+			}
+
+			det_w = (uint32_t)w;
+			det_h = (uint32_t)h;
+			want_detect = true;
+			want_camera = true;
+			break;
+		}
 		case 't':
 
 			/* Accepted and ignored. It used to enable touch
@@ -1162,7 +2669,7 @@ int main(int argc, char **argv)
 			"%s: %s - touch will NOT be forwarded. Load rpmsg_char"
 			" and restart this program.\n",
 			rpmsg_dev, strerror(errno));
-	else if (write(rpfd, &hello, sizeof(hello)) != sizeof(hello))
+	else if (!rpmsg_send(rpfd, &hello, sizeof(hello)))
 		perror("write hello");
 
 	memset(&d, 0, sizeof(d));
@@ -1217,30 +2724,143 @@ int main(int argc, char **argv)
 	if (rpfd >= 0 && touch_open(&ts, touch_dev) < 0)
 		fprintf(stderr, "touch will NOT be forwarded\n");
 
-	printf("panel is up, %s - Ctrl-C takes it down\n",
-	       ts.fd >= 0 ? "forwarding touch" :
-	       "touch NOT forwarded (see above)");
+	/* Also not fatal, and for the same reason touch is not: the panel is up by
+	 * now, and holding it up is the job nothing else can do. A camera that
+	 * will not start should leave a working display and working touch behind
+	 * it, not take them down - that was the mistake with rpmsg being a
+	 * precondition for the modeset, where a missing kernel module produced a
+	 * dark panel and looked like a touch fault.
+	 */
 
-	/* Nothing to do but forward contacts. The remote drives its own window
-	 * from here on, so there is no frame loop and no reason to wake up other
-	 * than an input event - or, with no touch device, no reason to wake up at
-	 * all beyond noticing a signal.
+	if (want_camera) {
+		if (cam_open(&cam, "display", "mainpath", cam_dev, cam_w,
+			     cam_h, !quiet) < 0) {
+			fprintf(stderr, "camera will NOT be published\n");
+		} else {
+			struct timespec t;
+
+			cam.publish = true;
+
+			if (cam_publish_setup(&cam, shm, cam_w, cam_h) < 0) {
+				cam_close(&cam);
+				fprintf(stderr,
+					"camera will NOT be published\n");
+			}
+
+			/* Start the reporting interval here rather than leaving
+			 * it at zero, or the first report divides by a guessed
+			 * five seconds and prints a rate that never happened.
+			 */
+
+			clock_gettime(CLOCK_MONOTONIC, &t);
+			cam_last_report = t.tv_sec;
+
+			if (rpfd < 0)
+				fprintf(stderr,
+					"camera: no rpmsg channel, frames are"
+					" published but the remote will not be"
+					" told - it polls the descriptor, so"
+					" expect latency\n");
+		}
+	}
+
+	/* The second stream, opened only to find out whether it can exist.
+	 *
+	 * Nothing downstream of it is written yet - no RGA, no inference, no
+	 * results. It dequeues, counts and requeues, because the one thing that
+	 * could still invalidate the whole detector plan is the ISP not managing
+	 * two paths at once under this sensor's timing, and that is cheaper to
+	 * find out now than after the protocol is written around it.
+	 *
+	 * Failing to open it is not fatal for the same reason nothing else here
+	 * is: the panel, touch and the display stream are all working by this
+	 * point, and a second capture that will not start should not take them
+	 * down with it.
+	 */
+
+	if (want_detect) {
+		if (cam_open(&det, "detect", "selfpath", det_dev, det_w, det_h,
+			     !quiet) < 0) {
+			fprintf(stderr,
+				"second stream will NOT run - the detector"
+				" would have to share the display stream\n");
+		} else {
+			printf("detect stream: counting only, no conversion,"
+			       " no inference\n");
+		}
+	}
+
+	/* The detector, last, and only if the camera came up: its boxes are in the
+	 * published frame's coordinate space, so without a frame they describe a
+	 * space that does not exist.
+	 *
+	 * Not fatal either, for the reason everything else here is not fatal.
+	 */
+
+	if (want_synth && cam.fd >= 0) {
+		if (det_start(&ai, shm, cam.out_w, cam.out_h, rpfd, true) < 0)
+			fprintf(stderr, "detector will NOT run\n");
+	} else if (want_synth) {
+		fprintf(stderr,
+			"detector needs the camera - boxes are in the published"
+			" frame's coordinates\n");
+	}
+
+	printf("panel is up, %s%s%s%s - Ctrl-C takes it down\n",
+	       ts.fd >= 0 ? "forwarding touch" :
+	       "touch NOT forwarded (see above)",
+	       cam.fd >= 0 ? ", publishing camera frames" : "",
+	       det.fd >= 0 ? ", counting a second stream" : "",
+	       ai.running ? ", publishing detections" : "");
+
+	/* Two things can wake this up now: a contact, and a captured frame. Both
+	 * on one poll rather than a thread each, because neither does enough work
+	 * to be worth the synchronisation - a contact is a dozen bytes and a frame
+	 * is one conversion pass - and because a single loop keeps the ordering
+	 * obvious if they ever start interfering.
+	 *
+	 * With neither present there is nothing to wait for but a signal, which is
+	 * what pause() is for.
 	 */
 
 	while (!g_stop) {
-		struct pollfd pfd;
+		struct pollfd pfd[3];
+		int nfds = 0;
+		int tsidx = -1;
+		int camidx = -1;
+		int detidx = -1;
 		int n;
 
-		if (ts.fd < 0) {
+		if (ts.fd >= 0) {
+			tsidx = nfds;
+			pfd[nfds].fd = ts.fd;
+			pfd[nfds].events = POLLIN;
+			pfd[nfds].revents = 0;
+			nfds++;
+		}
+
+		if (cam.fd >= 0) {
+			camidx = nfds;
+			pfd[nfds].fd = cam.fd;
+			pfd[nfds].events = POLLIN;
+			pfd[nfds].revents = 0;
+			nfds++;
+		}
+
+		if (det.fd >= 0) {
+			detidx = nfds;
+			pfd[nfds].fd = det.fd;
+			pfd[nfds].events = POLLIN;
+			pfd[nfds].revents = 0;
+			nfds++;
+		}
+
+		if (nfds == 0) {
 			pause();
 			continue;
 		}
 
-		pfd.fd = ts.fd;
-		pfd.events = POLLIN;
-		pfd.revents = 0;
-
-		n = poll(&pfd, 1, 1000);
+		n = poll(pfd, nfds, 1000);
 		if (n < 0) {
 			if (errno == EINTR)
 				continue;
@@ -1248,13 +2868,119 @@ int main(int argc, char **argv)
 			goto out;
 		}
 
-		if (n > 0 && (pfd.revents & POLLIN))
+		if (n == 0)
+			continue;
+
+		if (tsidx >= 0 && (pfd[tsidx].revents & POLLIN))
 			touch_drain(&ts, rpfd, fb_w, fb_h, !quiet);
+
+		if (camidx >= 0 && (pfd[camidx].revents & POLLIN))
+			cam_drain(&cam, rpfd, !quiet);
+
+		/* Drained after the display stream, deliberately. If the two ever
+		 * compete for time in this loop, the one that matters should win.
+		 */
+
+		if (detidx >= 0 && (pfd[detidx].revents & POLLIN))
+			cam_drain(&det, -1, !quiet);
+
+		/* Say something periodically while capturing, because otherwise
+		 * this program is completely silent once it starts and the only
+		 * way to find out whether frames are moving is to stop it and
+		 * read the summary. A producer that has quietly stalled looks
+		 * exactly like one that is working.
+		 *
+		 * Printed regardless of -q: that flag is documented as
+		 * suppressing the per-contact log, and one line every few seconds
+		 * is not that.
+		 */
+
+		if (cam.fd >= 0) {
+			struct timespec now;
+
+			clock_gettime(CLOCK_MONOTONIC, &now);
+
+			if (now.tv_sec - cam_last_report >= 5) {
+				uint32_t d = cam.published - cam_last_count;
+				long secs = now.tv_sec - cam_last_report;
+
+				uint32_t n = cam.published ? cam.published : 1;
+
+				printf("camera: %u frames (%lu.%lu fps) cpu%d |"
+				       " fetch %lu/%u convert %lu/%u"
+				       " publish %lu/%u us | gaps %u/%u\n",
+				       cam.published,
+				       (unsigned long)(d / secs),
+				       (unsigned long)((d * 10 / secs) % 10),
+				       cam.cpu,
+				       (unsigned long)(cam.fetch_us_sum / n),
+				       cam.fetch_us_max,
+				       (unsigned long)(cam.convert_us_sum / n),
+				       cam.convert_us_max,
+				       (unsigned long)(cam.copy_us_sum / n),
+				       cam.copy_us_max,
+				       cam.gaps, cam.gap_frames);
+
+				/* Reported on its own line rather than folded
+				 * into the one above, because the two streams
+				 * are being compared and a reader should not
+				 * have to disentangle which number belongs to
+				 * which.
+				 */
+
+				if (det.fd >= 0) {
+					uint32_t dd = det.published -
+						      det_last_count;
+
+					printf("detect: %u frames (%lu.%lu fps)"
+					       " %ux%u | gaps %u/%u\n",
+					       det.published,
+					       (unsigned long)(dd / secs),
+					       (unsigned long)((dd * 10 / secs)
+							       % 10),
+					       det.src_w, det.src_h,
+					       det.gaps, det.gap_frames);
+
+					det_last_count = det.published;
+				}
+
+				cam_last_report = now.tv_sec;
+				cam_last_count = cam.published;
+			}
+		}
 	}
 
 	ret = EXIT_SUCCESS;
 
 out:
+	/* Stopped first, so the thread is not still publishing into a block whose
+	 * magic is about to be cleared, and not still writing to a descriptor
+	 * that is about to be closed.
+	 */
+
+	det_stop(&ai);
+
+	if (det.fd >= 0) {
+		printf("detect: %u frames, %u gaps totalling %u lost frames\n",
+		       det.published, det.gaps, det.gap_frames);
+		cam_close(&det);
+	}
+
+	if (cam.fd >= 0) {
+		uint32_t n = cam.published ? cam.published : 1;
+
+		printf("camera: %u frames published on cpu%d | fetch %lu/%u"
+		       " convert %lu/%u publish %lu/%u us (mean/max)"
+		       " | %u gaps totalling %u lost frames\n",
+		       cam.published, cam.cpu,
+		       (unsigned long)(cam.fetch_us_sum / n), cam.fetch_us_max,
+		       (unsigned long)(cam.convert_us_sum / n),
+		       cam.convert_us_max,
+		       (unsigned long)(cam.copy_us_sum / n), cam.copy_us_max,
+		       cam.gaps, cam.gap_frames);
+		cam_close(&cam);
+	}
+
 	if (ts.fd >= 0)
 		close(ts.fd);
 

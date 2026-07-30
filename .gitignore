@@ -12,3 +12,12 @@ _a55_backup/
 amp_shm_test
 amp_shm_scan
 amp_fb_show
+amp_npu_probe
+amp_rga_probe
+
+# Board-side NPU bundle: vendor runtime, a prebuilt model and the vendor demos,
+# all copied out of rknn-toolkit2 rather than authored here. About 23MB, and
+# reconstructible - see the "npu-a17" section of
+# armbian/.kiro/board-changes/rk3588-evb7-v11.md for what goes in it and the
+# toolchain that builds the C++ parts.
+npu-a17/

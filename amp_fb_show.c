@@ -1,11 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
 /*
- * Put the frames NuttX draws on the panel.
+ * Light the panel for NuttX, and forward touch to it.
  *
- * NuttX (cpu_l3) owns no display hardware - the VOP's IOMMU and interrupt are
- * shared across all of its video ports, so it cannot be split between cores.
- * What it does instead is draw into amp-shmem@31000000 and say so. This program
- * is the other half: it takes those frames and scans them out through DRM.
+ * This program used to scan out frames NuttX had drawn into shared memory. It no
+ * longer carries pixels at all: NuttX programs the VOP's Esmart3 window itself
+ * and the hardware scans out of NuttX's own RAM, so frames never come through
+ * here. What is left are the two things NuttX cannot do for itself.
+ *
+ * Lighting the panel. Bringing up 1080x1920 MIPI-DSI means a D-PHY PLL, the MIPI
+ * host controller, the panel's initialisation sequence over DCS, a video port
+ * timing generator and four clock trees - about thirteen thousand lines of Linux.
+ * None of it is per-frame state; it is set once at modeset and stays set. So this
+ * program does a modeset and then stays alive holding it, because exiting would
+ * restore the previous CRTC configuration and take the panel down with it.
+ *
+ * The dumb buffer it creates is never drawn into after the initial clear. It
+ * exists because a CRTC cannot be given a mode without a framebuffer on its
+ * primary plane, and vp3's primary plane is Cluster3. NuttX's window, Esmart3,
+ * sits above it on the same video port, which the device tree reserved for that
+ * purpose. So the black buffer here is scaffolding for the modeset, not a
+ * picture.
+ *
+ * Forwarding touch. The controller is on i2c5 with its interrupt on a GPIO
+ * bank 3 pin; that bank has one interrupt line for all of its pins, and the
+ * Type-C power delivery controller's interrupt is on the same bank. Claiming it
+ * from the other core would break charging. This side also happens to be the
+ * side that knows both the panel geometry and the controller's range, so the
+ * coordinate mapping and its inverse stay derived from the same numbers rather
+ * than living in two programs that can drift apart.
  *
  * Two things are deliberately avoided:
  *
@@ -33,31 +55,15 @@
  *       -o amp_fb_show amp_fb_show.c
  *
  * Run:
- *   ./amp_fb_show              follow the remote, redraw on every new frame
- *   ./amp_fb_show -r 200       also ask the remote for a frame every 200ms,
- *                              which animates its built-in test pattern and
- *                              proves the path without an application on the
- *                              NuttX side
- *   ./amp_fb_show -p           never touch rpmsg, just poll the control block
- *   ./amp_fb_show -n 10        stop after 10 frames
- *   ./amp_fb_show -t           also forward touch events to the remote
- *   ./amp_fb_show -t -T /dev/input/event3
- *                              forward touch from a specific device instead of
+ *   ./amp_fb_show              light the panel, forward touch, stay alive
+ *   ./amp_fb_show -T /dev/input/event3
+ *                              use a specific touch device instead of
  *                              auto-detecting one
+ *   ./amp_fb_show -q           no per-contact logging
  *
- * Touch runs in the same program and over the same rpmsg endpoint as the frame
- * signalling, for two reasons. The mechanical one: rpmsg_char binds one channel
- * per announced name and lets a single process open it, so a second channel
- * would need some out-of-band way to tell the two apart, which is no more
- * robust than a cmd field. The substantive one: this is the only component that
- * knows both the panel geometry and the touch controller's range, so the
- * coordinate mapping and its inverse are derived from the same numbers here
- * instead of living in two programs that can drift apart.
- *
- * The remote cannot take the touch hardware itself: the controller is on i2c5
- * with its interrupt on a GPIO bank 3 pin, that bank has one interrupt line for
- * all of its pins, and the Type-C power delivery controller's interrupt is on
- * the same bank.
+ * It has to keep running. Ctrl-C or SIGTERM restores the CRTC and releases DRM
+ * master on the way out, which is what a well-behaved DRM client does, and also
+ * what takes the panel down - so backgrounding it is the normal way to use it.
  *
  * The layout below has to match
  * boards/arm64/rk3588/evb7-amp/src/evb7_amp_shm.h in the NuttX tree.
@@ -83,8 +89,12 @@
 
 #define AMP_SHM_BASE       0x31000000UL
 #define AMP_SHM_SIZE       (4 * 1024 * 1024)
-#define AMP_SHM_MAGIC      0x30424641u    /* "AFB0" */
-#define AMP_SHM_NBUFFERS   2
+/* Bumped with the layout - see the comment in evb7_amp_shm.h for why the version
+ * field is not enough on its own.
+ */
+
+#define AMP_SHM_MAGIC      0x31424641u    /* "AFB1" */
+#define AMP_SHM_VERSION    2
 
 /* The first page is skipped because something outside this project writes three
  * words at its start - see the comment in evb7_amp_shm.h.
@@ -92,15 +102,21 @@
 
 #define AMP_SHM_HDR_OFFSET 4096
 
-#define AMP_SHM_CMD_RENDER 1
-#define AMP_SHM_CMD_READY  2
-#define AMP_SHM_CMD_ACK    3
+/* 1, 2 and 3 were the frame protocol - render, ready, ack. They are left unused
+ * rather than recycled so that a mismatched pair of binaries reports an unknown
+ * command instead of misreading one message as another.
+ */
+
 #define AMP_SHM_CMD_TOUCH  4
 #define AMP_SHM_CMD_HELLO  5
 
 #define AMP_TOUCH_DOWN     0
 #define AMP_TOUCH_MOVE     1
 #define AMP_TOUCH_UP       2
+
+/* Geometry only. The remote publishes it so that the coordinate scaling below
+ * follows whatever resolution its framebuffer actually is.
+ */
 
 struct amp_shm_ctrl {
 	uint32_t magic;
@@ -109,25 +125,17 @@ struct amp_shm_ctrl {
 	uint32_t height;
 	uint32_t stride;
 	uint32_t bpp;
-	uint32_t nbuffers;
-	uint32_t bufsize;
-	uint32_t bufoffset[AMP_SHM_NBUFFERS];
-	uint32_t frame_seq;
-	uint32_t ready_index;
-	uint32_t ready_sum;
 } __attribute__((packed));
 
-struct amp_shm_msg {
-	uint32_t cmd;
-	uint32_t seq;
-	uint32_t index;
-	uint32_t sum;
-} __attribute__((packed));
-
-/* Same 16 bytes as amp_shm_msg, read as a touch event when cmd says so. Keeping
- * the sizes equal means the receiver reads one fixed-size message and then looks
- * at cmd, rather than needing the length before the read.
+/* Every message on this endpoint is 16 bytes and starts with cmd. This is the
+ * header view, used for the hello; the touch structure is the same bytes in
+ * full.
  */
+
+struct amp_shm_hdr {
+	uint32_t cmd;
+	uint32_t pad[3];
+} __attribute__((packed));
 
 struct amp_touch_msg {
 	uint32_t cmd;
@@ -165,31 +173,6 @@ static void on_signal(int sig)
 {
 	(void)sig;
 	g_stop = 1;
-}
-
-static uint64_t now_ms(void)
-{
-	struct timespec tv;
-
-	clock_gettime(CLOCK_MONOTONIC, &tv);
-	return (uint64_t)tv.tv_sec * 1000 + tv.tv_nsec / 1000000;
-}
-
-/*
- * Sum a buffer the way the remote does: 32-bit words, wrapping. Read through a
- * volatile pointer so the compiler cannot reuse an earlier load - the memory is
- * written by another core.
- */
-static uint32_t sum_buffer(const volatile uint32_t *buf, size_t bytes)
-{
-	uint32_t sum = 0;
-	size_t words = bytes / 4;
-	size_t i;
-
-	for (i = 0; i < words; i++)
-		sum += buf[i];
-
-	return sum;
 }
 
 /****************************************************************************
@@ -507,89 +490,6 @@ static void display_cleanup(struct display *d)
 
 	if (d->fd >= 0)
 		close(d->fd);
-}
-
-/****************************************************************************
- * Blit
- ****************************************************************************/
-
-/*
- * Nearest-neighbour scale from the shared buffer to the dumb buffer.
- *
- * The remote draws at half the panel's resolution because two full-size
- * ARGB8888 frames do not fit in the 4MB carveout, so some scaling is always
- * needed. With the panel at 1080x1920 and the remote at 540x960 this is an exact
- * 2x, but the ratio is computed rather than assumed so a different mode still
- * produces a picture instead of a crash.
- *
- * Every access to the shared buffer goes through two staging rows in ordinary
- * memory, and that is the whole point rather than tidiness. The shared area is
- * mapped uncached, so reading it one pixel at a time costs a DRAM round trip per
- * pixel with nothing cached to amortise it - and scaling up by two reads each
- * source pixel four times. Pulling a source row across with a single memcpy uses
- * wide loads and touches each source byte once; the scaling then reads from
- * ordinary cached memory, and the result goes out to the framebuffer as one
- * sequential write per row.
- *
- * Fixed point, 16 fractional bits: at these sizes the step fits comfortably and
- * there is no rounding drift across a row.
- */
-static void blit_scaled(struct display *d, const volatile uint32_t *src,
-			uint32_t src_w, uint32_t src_h, uint32_t src_stride)
-{
-	static uint32_t *srcrow;
-	static uint32_t *dstrow;
-	static size_t srcrow_len;
-	static size_t dstrow_len;
-	uint32_t x_step = (src_w << 16) / d->width;
-	uint32_t y_step = (src_h << 16) / d->height;
-	uint32_t src_words = src_stride / 4;
-	uint32_t cached_y = UINT32_MAX;
-	uint32_t y;
-
-	if (srcrow_len < src_stride) {
-		free(srcrow);
-		srcrow = malloc(src_stride);
-		srcrow_len = srcrow ? src_stride : 0;
-	}
-
-	if (dstrow_len < (size_t)d->width * 4) {
-		free(dstrow);
-		dstrow = malloc((size_t)d->width * 4);
-		dstrow_len = dstrow ? (size_t)d->width * 4 : 0;
-	}
-
-	if (srcrow == NULL || dstrow == NULL) {
-		fprintf(stderr, "out of memory for scaling buffers\n");
-		return;
-	}
-
-	for (y = 0; y < d->height; y++) {
-		uint32_t sy = (y * y_step) >> 16;
-
-		/* Scaling up means consecutive output rows often come from the
-		 * same input row. Expanding it once and reusing the result keeps
-		 * the uncached reads down to one pass over the source.
-		 */
-
-		if (sy != cached_y) {
-			uint32_t xacc = 0;
-			uint32_t x;
-
-			memcpy(srcrow, (const void *)(src + (size_t)sy *
-						      src_words), src_stride);
-
-			for (x = 0; x < d->width; x++) {
-				dstrow[x] = srcrow[xacc >> 16];
-				xacc += x_step;
-			}
-
-			cached_y = sy;
-		}
-
-		memcpy(d->map + (size_t)y * d->pitch, dstrow,
-		       (size_t)d->width * 4);
-	}
 }
 
 /****************************************************************************
@@ -1116,17 +1016,15 @@ static void touch_drain(struct touch_src *ts, int rpfd, uint32_t fb_w,
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"usage: %s [-d card] [-r ms] [-n frames] [-p] [-q] [-t]"
-		" [-T dev]\n"
+		"usage: %s [-d card] [-T dev] [-q]\n"
 		"  -d card    DRM device (default /dev/dri/card0)\n"
-		"  -r ms      also request a frame from the remote every ms\n"
-		"  -n frames  stop after this many frames (default: run until"
-		" interrupted)\n"
-		"  -p         passive: poll the control block, never open"
-		" /dev/rpmsg0\n"
-		"  -q         one line per frame instead of per-frame detail\n"
-		"  -t         forward touch events to the remote\n"
-		"  -T dev     touch event device (default: auto-detect)\n",
+		"  -T dev     touch event device (default: auto-detect)\n"
+		"  -q         do not log each contact\n"
+		"  -t         accepted and ignored (touch is always on now)\n"
+		"\n"
+		"Lights the panel and forwards touch to the AMP core. Keeps\n"
+		"running: exiting restores the previous CRTC configuration,\n"
+		"which takes the panel down.\n",
 		prog);
 }
 
@@ -1137,65 +1035,41 @@ int main(int argc, char **argv)
 	struct display d;
 	volatile struct amp_shm_ctrl *ctrl;
 	volatile uint8_t *shm;
+	struct amp_shm_hdr hello = { .cmd = AMP_SHM_CMD_HELLO };
 	int memfd;
 	int rpfd = -1;
-	int request_ms = 0;
-	long limit = 0;
-	bool passive = false;
 	bool quiet = false;
-	bool want_touch = false;
 	const char *touch_dev = NULL;
 	struct touch_src ts;
-	long shown = 0;
-	long shown_at_report = 0;
-	uint32_t last_seq;
-	uint64_t next_request;
-	uint64_t next_report = 0;
-	uint64_t report_at = 0;
-
-	/* Where the frame time goes, split between the two sides.
-	 *
-	 * blit_ms is what this program spends scaling a frame onto the screen;
-	 * wait_ms is what it spends with nothing to do, waiting for the remote to
-	 * announce the next one. Both sides draw into non-cacheable memory pixel
-	 * by pixel, so both are plausible causes of a slow frame rate, and the fix
-	 * for one is a rewrite here while the fix for the other is a new buffer in
-	 * the remote's framebuffer driver. Measuring which is which is cheaper than
-	 * guessing, and much cheaper than reflashing to test a guess.
-	 */
-
-	uint64_t blit_ms = 0;
-	uint64_t wait_ms = 0;
-	uint64_t frame_done = 0;
+	uint32_t fb_w;
+	uint32_t fb_h;
 	int opt;
 	int ret = EXIT_FAILURE;
 
 	memset(&ts, 0, sizeof(ts));
 	ts.fd = -1;
 
-	while ((opt = getopt(argc, argv, "d:r:n:pqtT:h")) != -1) {
+	while ((opt = getopt(argc, argv, "d:T:qth")) != -1) {
 		switch (opt) {
 		case 'd':
 			card = optarg;
 			break;
-		case 'r':
-			request_ms = atoi(optarg);
-			break;
-		case 'n':
-			limit = atol(optarg);
-			break;
-		case 'p':
-			passive = true;
+		case 'T':
+			touch_dev = optarg;
 			break;
 		case 'q':
 			quiet = true;
 			break;
 		case 't':
-			want_touch = true;
-			break;
-		case 'T':
-			touch_dev = optarg;
-			want_touch = true;
+
+			/* Accepted and ignored. It used to enable touch
+			 * forwarding, which is now the whole job. Rejecting it
+			 * would make the program refuse to start for anyone
+			 * whose habit or script still passes it - and refusing
+			 * to start means no modeset, so the panel stays dark:
+			 * an expensive way to enforce a spelling.
+			 */
+
 			break;
 		default:
 			usage(argv[0]);
@@ -1203,20 +1077,25 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* Touch needs the rpmsg channel; there is nowhere else to send it. */
+	/* Line buffering, because this program now runs indefinitely.
+	 *
+	 * stdio picks full buffering when stdout is not a terminal, and nothing
+	 * here flushes: the loop at the end never returns, so every startup
+	 * message would sit in a 4KB buffer until the process was killed. The
+	 * previous version got away with it by printing a frame report every
+	 * couple of seconds, which eventually filled the buffer. This one prints
+	 * nothing after setup, so with output redirected or piped it would look
+	 * exactly like a program that had failed silently.
+	 */
 
-	if (want_touch && passive) {
-		fprintf(stderr,
-			"-t needs the rpmsg channel, so it cannot be combined"
-			" with -p\n");
-		return EXIT_FAILURE;
-	}
+	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
 
 	/* The carveout is declared no-map, so it is not in the kernel's linear
-	 * map and /dev/mem is the way to reach it.
+	 * map and /dev/mem is the way to reach it. Only the control block is
+	 * read - the frame buffers that used to follow it are gone.
 	 */
 
 	memfd = open("/dev/mem", O_RDWR | O_SYNC);
@@ -1243,42 +1122,54 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	printf("remote frame source: %ux%u, %u bpp, stride %u, %u buffers\n",
-	       ctrl->width, ctrl->height, ctrl->bpp, ctrl->stride,
-	       ctrl->nbuffers);
-
-	/* Open the channel and say hello before touching the display.
-	 *
-	 * The hello is not a courtesy, it is the only way the remote learns where
-	 * to send. Its rpmsg layer takes the peer address from the first message
-	 * it receives, and opening this device transmits nothing by itself - so
-	 * until something goes out from here, every frame the remote publishes is
-	 * written to the control block and never announced.
-	 *
-	 * It goes first, before the modeset, because an application on the remote
-	 * may already be drawing. Anything it announces in the meantime waits in
-	 * the channel until the loop below starts reading, instead of being lost
-	 * for want of an address.
+	/* A version mismatch means the two sides disagree about the layout of
+	 * everything after the magic, which is worth stopping for rather than
+	 * reading plausible-looking geometry out of the wrong offsets.
 	 */
 
-	if (!passive) {
-		struct amp_shm_msg hello = {
-			.cmd = AMP_SHM_CMD_HELLO,
-		};
-
-		rpfd = open(rpmsg_dev, O_RDWR);
-		if (rpfd < 0)
-			fprintf(stderr,
-				"%s: %s - falling back to polling the control"
-				" block\n", rpmsg_dev, strerror(errno));
-		else if (write(rpfd, &hello, sizeof(hello)) != sizeof(hello))
-			perror("write hello");
+	if (ctrl->version != AMP_SHM_VERSION) {
+		fprintf(stderr,
+			"remote speaks version %u, this program speaks %u -"
+			" rebuild whichever is older\n",
+			ctrl->version, AMP_SHM_VERSION);
+		return EXIT_FAILURE;
 	}
+
+	fb_w = ctrl->width;
+	fb_h = ctrl->height;
+
+	printf("remote framebuffer: %ux%u, %u bpp (touch is scaled to this)\n",
+	       fb_w, fb_h, ctrl->bpp);
+
+	/* Open the channel touch will go out on, and say hello. The hello is no
+	 * longer load-bearing - nothing is sent from the remote any more - but it
+	 * puts one unambiguous line in both logs saying the channel came up,
+	 * which is the cheapest way to tell "no touch because the channel is
+	 * down" from "no touch because nobody is touching".
+	 *
+	 * Not fatal if it fails, and that is a correction rather than leniency.
+	 * Lighting the panel and forwarding touch are independent jobs, and the
+	 * first cut of this made the second a precondition for the first: without
+	 * rpmsg_char loaded the program returned before the modeset, so a missing
+	 * module took the display with it. The remote drives its own window, so
+	 * something was still on screen - which made it look like touch had
+	 * broken on its own.
+	 */
+
+	rpfd = open(rpmsg_dev, O_RDWR);
+	if (rpfd < 0)
+		fprintf(stderr,
+			"%s: %s - touch will NOT be forwarded. Load rpmsg_char"
+			" and restart this program.\n",
+			rpmsg_dev, strerror(errno));
+	else if (write(rpfd, &hello, sizeof(hello)) != sizeof(hello))
+		perror("write hello");
 
 	memset(&d, 0, sizeof(d));
 	d.fd = open(card, O_RDWR | O_CLOEXEC);
 	if (d.fd < 0) {
 		perror(card);
+		close(rpfd);
 		return EXIT_FAILURE;
 	}
 
@@ -1295,6 +1186,7 @@ int main(int argc, char **argv)
 			"    systemctl isolate multi-user.target\n",
 			strerror(errno));
 		close(d.fd);
+		close(rpfd);
 		return EXIT_FAILURE;
 	}
 
@@ -1308,235 +1200,58 @@ int main(int argc, char **argv)
 	if (save_crtc(&d) < 0)
 		goto out;
 
+	/* Black, and never drawn into again. This buffer is what lets the CRTC
+	 * take a mode; the remote's window sits above it.
+	 */
+
 	if (create_dumb_fb(&d) < 0)
 		goto out;
 
 	if (set_crtc(&d, d.fb_id, &d.mode, 1) < 0)
 		goto out;
 
-	if (want_touch) {
-		if (rpfd < 0) {
-			fprintf(stderr,
-				"touch has nowhere to go without %s - is"
-				" rpmsg_char loaded?\n", rpmsg_dev);
-			goto out;
-		}
-
-		if (touch_open(&ts, touch_dev) < 0)
-			goto out;
-	}
-
-	/* Show whatever is already there, so a still frame drawn before this
-	 * program started is not invisible until the next update.
+	/* Also not fatal. The panel is already up by this point, and holding it up
+	 * is the job that cannot be done from anywhere else.
 	 */
 
-	last_seq = ctrl->frame_seq;
-	if (last_seq != 0) {
-		blit_scaled(&d,
-			    (const volatile uint32_t *)
-				(shm + ctrl->bufoffset[ctrl->ready_index]),
-			    ctrl->width, ctrl->height, ctrl->stride);
-		printf("frame %u (buf%u) on screen\n", last_seq,
-		       ctrl->ready_index);
-	}
+	if (rpfd >= 0 && touch_open(&ts, touch_dev) < 0)
+		fprintf(stderr, "touch will NOT be forwarded\n");
 
-	next_request = now_ms();
+	printf("panel is up, %s - Ctrl-C takes it down\n",
+	       ts.fd >= 0 ? "forwarding touch" :
+	       "touch NOT forwarded (see above)");
 
-	while (!g_stop && (limit == 0 || shown < limit)) {
-		uint32_t seq;
-		uint32_t index;
-		uint32_t remote_sum;
-		uint32_t local_sum;
+	/* Nothing to do but forward contacts. The remote drives its own window
+	 * from here on, so there is no frame loop and no reason to wake up other
+	 * than an input event - or, with no touch device, no reason to wake up at
+	 * all beyond noticing a signal.
+	 */
 
-		if (rpfd >= 0) {
-			struct pollfd pfd[2];
-			struct amp_shm_msg msg;
-			int rp_i;
-			int ts_i = -1;
-			int nfds = 0;
-			int timeout;
-			uint64_t t;
-			int n;
+	while (!g_stop) {
+		struct pollfd pfd;
+		int n;
 
-			/* Render requests are paced by the clock, not by loop
-			 * iterations. The loop now also wakes for touch events,
-			 * and asking for a frame on every wakeup would flood the
-			 * remote the moment a finger moves.
-			 */
-
-			if (request_ms > 0) {
-				t = now_ms();
-
-				if (t >= next_request) {
-					struct amp_shm_msg req = {
-						.cmd = AMP_SHM_CMD_RENDER,
-					};
-
-					if (write(rpfd, &req, sizeof(req)) !=
-					    sizeof(req))
-						perror("write render request");
-
-					next_request = t + request_ms;
-				}
-
-				t = now_ms();
-				timeout = next_request > t ?
-					  (int)(next_request - t) : 0;
-			} else {
-				timeout = 1000;
-			}
-
-			pfd[nfds].fd = rpfd;
-			pfd[nfds].events = POLLIN;
-			rp_i = nfds++;
-
-			if (ts.fd >= 0) {
-				pfd[nfds].fd = ts.fd;
-				pfd[nfds].events = POLLIN;
-				ts_i = nfds++;
-			}
-
-			n = poll(pfd, nfds, timeout);
-			if (n < 0) {
-				if (errno == EINTR)
-					continue;
-				perror("poll");
-				goto out;
-			}
-
-			if (ts_i >= 0 && (pfd[ts_i].revents & POLLIN))
-				touch_drain(&ts, rpfd, ctrl->width,
-					    ctrl->height, !quiet);
-
-			if (!(pfd[rp_i].revents & POLLIN))
-				continue;
-
-			if (read(rpfd, &msg, sizeof(msg)) != sizeof(msg))
-				continue;
-
-			if (msg.cmd != AMP_SHM_CMD_READY)
-				continue;
-
-			seq = msg.seq;
-			index = msg.index;
-			remote_sum = msg.sum;
-		} else {
-			/* No rpmsg: watch the control block. The remote updates
-			 * frame_seq last, after the pixels and the checksum, so
-			 * seeing a new sequence means the rest is already there.
-			 */
-
-			seq = ctrl->frame_seq;
-			if (seq == last_seq) {
-				usleep(request_ms > 0 ?
-				       request_ms * 1000 : 16000);
-				continue;
-			}
-
-			index = ctrl->ready_index;
-			remote_sum = ctrl->ready_sum;
-		}
-
-		if (index >= ctrl->nbuffers) {
-			fprintf(stderr, "frame %u: bad buffer index %u\n",
-				seq, index);
+		if (ts.fd < 0) {
+			pause();
 			continue;
 		}
 
-		{
-			const volatile uint32_t *src =
-				(const volatile uint32_t *)
-					(shm + ctrl->bufoffset[index]);
+		pfd.fd = ts.fd;
+		pfd.events = POLLIN;
+		pfd.revents = 0;
 
-			/* A zero from the remote means it did not checksum this
-			 * frame, which is what the display path does: summing
-			 * costs a full read of the buffer out of uncached memory
-			 * on each side, per frame, and that showed up directly in
-			 * the frame rate. Verification is still available through
-			 * the test pattern, which gets its sum for free while it
-			 * draws.
-			 *
-			 * When there is a sum, it is computed here before scaling,
-			 * so a mismatch points at the transport rather than at
-			 * this program's arithmetic.
-			 */
-
-			uint64_t t0;
-
-			local_sum = remote_sum != 0 ?
-				    sum_buffer(src, ctrl->bufsize) : 0;
-
-			/* The wait is measured from the end of the previous
-			 * frame, so it covers the remote's whole render cycle.
-			 */
-
-			t0 = now_ms();
-			if (frame_done != 0)
-				wait_ms += t0 - frame_done;
-
-			blit_scaled(&d, src, ctrl->width, ctrl->height,
-				    ctrl->stride);
-
-			frame_done = now_ms();
-			blit_ms += frame_done - t0;
+		n = poll(&pfd, 1, 1000);
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			perror("poll");
+			goto out;
 		}
 
-		last_seq = seq;
-		shown++;
-
-		if (remote_sum == 0) {
-			/* No checksum to compare, so report a rate instead. A
-			 * line per frame would be noise on a console the remote
-			 * also logs to, and the useful number here is frames per
-			 * second - which is also the rate at which the remote's
-			 * toolkit polls its input device, so it says as much
-			 * about responsiveness as about smoothness.
-			 */
-
-			uint64_t t = now_ms();
-
-			if (!quiet && t >= next_report) {
-				long n = shown - shown_at_report;
-
-				if (report_at != 0 && n > 0)
-					printf("%.1f fps: blit %llu ms/frame,"
-					       " waiting on remote %llu"
-					       " ms/frame\n",
-					       n * 1000.0 / (t - report_at),
-					       (unsigned long long)
-						(blit_ms / n),
-					       (unsigned long long)
-						(wait_ms / n));
-
-				report_at = t;
-				shown_at_report = shown;
-				blit_ms = 0;
-				wait_ms = 0;
-				next_report = t + 2000;
-			}
-
-			continue;
-		}
-
-		if (!quiet || local_sum != remote_sum)
-			printf("frame %u buf%u: remote 0x%08x, local 0x%08x"
-			       " -> %s\n", seq, index, remote_sum, local_sum,
-			       local_sum == remote_sum ? "MATCH" : "MISMATCH");
-
-		if (rpfd >= 0) {
-			struct amp_shm_msg ack = {
-				.cmd = AMP_SHM_CMD_ACK,
-				.seq = seq,
-				.index = index,
-				.sum = local_sum,
-			};
-
-			if (write(rpfd, &ack, sizeof(ack)) != sizeof(ack))
-				perror("write ack");
-		}
+		if (n > 0 && (pfd.revents & POLLIN))
+			touch_drain(&ts, rpfd, fb_w, fb_h, !quiet);
 	}
 
-	printf("%ld frame(s) displayed\n", shown);
 	ret = EXIT_SUCCESS;
 
 out:

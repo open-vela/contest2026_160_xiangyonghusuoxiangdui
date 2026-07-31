@@ -149,6 +149,20 @@ gcc -O1 -Wall -Wextra -I"$build" -o "$build/det_emit_test" \
 "$build/det_emit_test" || fail=1
 
 say
+say "== touch event decoding =="
+
+# This one includes amp_fb_show.c whole rather than extracting from it, because
+# what it tests is a state machine spread across several functions rather than
+# one self-contained calculation. Built without -DAMP_WITH_RKNN on purpose: it
+# doubles as the check that the default build - the one with no vendor headers
+# anywhere - still compiles and runs.
+
+gcc -O1 -Wall -Wextra -o "$build/touch_decode_test" \
+	"$here/touch_decode_test.c" || exit 1
+
+"$build/touch_decode_test" | tail -3 || fail=1
+
+say
 if [ "$fail" = 0 ]; then
 	say "all detection tests pass"
 else

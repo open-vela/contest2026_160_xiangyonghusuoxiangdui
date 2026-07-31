@@ -2091,6 +2091,112 @@ static void cam_drain(struct camera *c, int rpfd, bool verbose)
 	}
 }
 
+/* Inference
+ * ---------------------------------------------------------------------------
+ * Compiled in only with -DAMP_WITH_RKNN, and dlopen'd even then.
+ *
+ * Two separate decisions, for two different reasons.
+ *
+ * The compile-time switch keeps this file buildable without a checkout of
+ * rknn-toolkit2 next to it. Only type definitions are needed at build time -
+ * rknn_tensor_attr, rga_buffer_t and friends - but needing them unconditionally
+ * would mean this program could not be built at all on a machine that has the
+ * board but not the vendor SDK, and the display and touch paths would become
+ * hostage to a dependency they do not use.
+ *
+ * The dlopen keeps the *binary* free of them. Linking librknnrt and librga would
+ * put them in DT_NEEDED, and a system without the RKNN runtime installed could
+ * then not even load the program - the loader fails before main(). Same failure
+ * mode as making the rpmsg open fatal, one layer lower down: an optional feature
+ * taking the essential ones with it. With dlopen, a missing library is a message
+ * and no detector, and the camera still draws.
+ *
+ * The libraries are looked up by plain name so LD_LIBRARY_PATH decides, which is
+ * how they are actually deployed on this board - copied next to the binary rather
+ * than installed.
+ */
+
+#ifdef AMP_WITH_RKNN
+
+#include <dlfcn.h>
+
+#include <math.h>
+
+#include "rknn_api.h"
+#include "im2d.h"
+#include "rga.h"
+
+/* Only the entry points this needs, and the RGA ones are the C variants -
+ * improcess() and wrapbuffer_virtualaddr_t() are declared IM_C_API, so the C++
+ * wrappers with their default arguments never come into it.
+ */
+
+struct rknn_fns {
+	void *lib;
+	int (*init)(rknn_context *, void *, uint32_t, uint32_t, rknn_init_extend *);
+	int (*destroy)(rknn_context);
+	int (*query)(rknn_context, rknn_query_cmd, void *, uint32_t);
+	int (*inputs_set)(rknn_context, uint32_t, rknn_input *);
+	int (*run)(rknn_context, rknn_run_extend *);
+	int (*outputs_get)(rknn_context, uint32_t, rknn_output *,
+			   rknn_output_extend *);
+	int (*outputs_release)(rknn_context, uint32_t, rknn_output *);
+	int (*set_core_mask)(rknn_context, rknn_core_mask);
+};
+
+struct rga_fns {
+	void *lib;
+	rga_buffer_t (*wrap)(void *, int, int, int, int, int);
+	IM_STATUS (*process)(rga_buffer_t, rga_buffer_t, rga_buffer_t, im_rect,
+			     im_rect, im_rect, int);
+};
+
+/* yolov5 output geometry. Not derived at run time because it is a property of
+ * the exported model rather than of the hardware, and getting it from the tensor
+ * shapes would mean inferring the anchor set - which is not in the model at all.
+ *
+ * These are the values the vendor post-processing uses for this model file; the
+ * decode below has to match them exactly or every box lands in the wrong place.
+ */
+
+#define YOLO_CLASSES     80
+#define YOLO_ANCHORS     3
+#define YOLO_PROPS       (5 + YOLO_CLASSES)   /* x y w h obj + classes */
+#define YOLO_HEADS       3
+
+/* The reference's thresholds, kept rather than retuned. A detector that boxes
+ * different things than the vendor demo would make any disagreement about
+ * correctness impossible to attribute - it could be the port or it could be the
+ * threshold, and there would be no way to tell which.
+ */
+
+#define YOLO_BOX_THRESH  0.25f
+#define YOLO_NMS_THRESH  0.45f
+
+static const int g_yolo_anchor[YOLO_HEADS][YOLO_ANCHORS * 2] = {
+	{  10,  13,  16,  30,  33,  23 },   /* stride 8  */
+	{  30,  61,  62,  45,  59, 119 },   /* stride 16 */
+	{ 116,  90, 156, 198, 373, 326 },   /* stride 32 */
+};
+
+static const int g_yolo_stride[YOLO_HEADS] = { 8, 16, 32 };
+
+/* One candidate surviving the confidence threshold, before NMS. */
+
+struct yolo_cand {
+	float x;                        /* left, in model pixels */
+	float y;                        /* top */
+	float w;
+	float h;
+	float score;
+	int cls;
+	bool keep;
+};
+
+#define YOLO_MAX_CAND 512
+
+#endif /* AMP_WITH_RKNN */
+
 /* Detection publishing
  * ---------------------------------------------------------------------------
  * The producer for the results block. What fills the boxes is separate from how
@@ -2136,6 +2242,90 @@ struct detector {
 	uint32_t height;
 	uint32_t published;
 	uint32_t notify_fail;
+
+#ifdef AMP_WITH_RKNN
+
+	/* Real inference. The camera this reads from is its own, not the one the
+	 * poll loop drains: this thread is the only consumer of those frames, so
+	 * handing them over would be a synchronisation problem invented for no
+	 * reason.
+	 */
+
+	struct camera *cam;
+	struct rknn_fns rk;
+	struct rga_fns rga;
+	rknn_context ctx;
+	void *model;
+
+	uint32_t in_w;                  /* model input, from the tensor attrs */
+	uint32_t in_h;
+	uint8_t *in_buf;                /* RGB888 the RGA writes and RKNN reads */
+
+	uint32_t n_out;
+	int32_t out_zp[YOLO_HEADS];
+	float out_scale[YOLO_HEADS];
+	uint32_t out_size[YOLO_HEADS];
+	void *out_buf[YOLO_HEADS];
+
+	/* Letterbox, computed once from the capture and model sizes. Kept rather
+	 * than recomputed so the forward transform used by the RGA and the inverse
+	 * used on the boxes cannot drift apart.
+	 */
+
+	float lb_scale;
+	uint32_t lb_pad_x;
+	uint32_t lb_pad_y;
+	uint32_t lb_w;                  /* the image inside the letterbox */
+	uint32_t lb_h;
+
+	struct yolo_cand cand[YOLO_MAX_CAND];
+
+	/* Phases timed apart, for the reason every other measurement in this
+	 * program is: a single total cannot say which half to fix.
+	 */
+
+	uint32_t rga_us_max;
+	uint32_t run_us_max;
+	uint32_t post_us_max;
+	uint64_t rga_us_sum;
+	uint64_t run_us_sum;
+	uint64_t post_us_sum;
+	uint32_t inferences;
+	uint32_t boxes_max;
+
+	/* How close the candidate list came to its ceiling.
+	 *
+	 * Reported because the ceiling is a silent one: yolo_decode() stops
+	 * collecting when the array is full, so a scene busy enough to fill it
+	 * would lose its lowest-scoring candidates before NMS ever saw them. That
+	 * is a defensible thing to do and an indefensible thing to do quietly.
+	 */
+
+	uint32_t cands_max;
+
+	/* Minimum published confidence, as the whole percent the transport
+	 * carries.
+	 *
+	 * This exists because the thresholds inside the decode are applied to the
+	 * two factors separately - objectness at 0.25 and best class at 0.25 - and
+	 * never to the product that becomes the score. A box whose factors are both
+	 * 0.28 passes and is published at 8 percent. The reference behaves the same
+	 * way and does not filter afterwards either, which is defensible for its own
+	 * purpose: it draws onto a still image for someone to inspect. Overlaid live
+	 * on a person it is not, and it was measured on this board - 47 of 107
+	 * detections came out under 25 percent, and five classes that were not in
+	 * the room at all appeared exclusively there.
+	 *
+	 * Applied after NMS on purpose. The decode and the suppression are proven
+	 * equivalent to the reference over 200 random tensors, and folding a
+	 * threshold into either of them would invalidate that; a separate stage
+	 * afterwards leaves it intact.
+	 */
+
+	uint32_t min_score;
+	uint32_t filtered;
+
+#endif
 };
 
 /****************************************************************************
@@ -2213,6 +2403,1053 @@ static void det_publish(struct detector *d, const struct amp_det_box *box,
 		d->notify_fail++;
 }
 
+#ifdef AMP_WITH_RKNN
+
+/****************************************************************************
+ * Name: det_load_libs
+ *
+ * Description:
+ *   Resolve everything needed from librknnrt and librga, or fail with the name
+ *   of what was missing.
+ *
+ *   Every symbol is looked up before any is used, so a partial load cannot get
+ *   as far as running an inference with a null pointer in the middle of it. The
+ *   name that failed is printed because "detector will not run" without it sends
+ *   the reader to the wrong library.
+ *
+ ****************************************************************************/
+
+#define DLSYM(h, dst, name)                                             \
+	do {                                                            \
+		*(void **)(&(dst)) = dlsym((h), (name));                \
+		if ((dst) == NULL) {                                    \
+			fprintf(stderr, "detector: %s: %s\n", (name),   \
+				dlerror());                             \
+			return -1;                                      \
+		}                                                       \
+	} while (0)
+
+static int det_load_libs(struct detector *d)
+{
+	d->rk.lib = dlopen("librknnrt.so", RTLD_NOW);
+	if (d->rk.lib == NULL) {
+		fprintf(stderr,
+			"detector: librknnrt.so: %s\n"
+			"  It is not linked on purpose - set LD_LIBRARY_PATH to"
+			" wherever it was copied.\n", dlerror());
+		return -1;
+	}
+
+	d->rga.lib = dlopen("librga.so", RTLD_NOW);
+	if (d->rga.lib == NULL) {
+		fprintf(stderr, "detector: librga.so: %s\n", dlerror());
+		return -1;
+	}
+
+	DLSYM(d->rk.lib, d->rk.init, "rknn_init");
+	DLSYM(d->rk.lib, d->rk.destroy, "rknn_destroy");
+	DLSYM(d->rk.lib, d->rk.query, "rknn_query");
+	DLSYM(d->rk.lib, d->rk.inputs_set, "rknn_inputs_set");
+	DLSYM(d->rk.lib, d->rk.run, "rknn_run");
+	DLSYM(d->rk.lib, d->rk.outputs_get, "rknn_outputs_get");
+	DLSYM(d->rk.lib, d->rk.outputs_release, "rknn_outputs_release");
+	DLSYM(d->rk.lib, d->rk.set_core_mask, "rknn_set_core_mask");
+
+	DLSYM(d->rga.lib, d->rga.wrap, "wrapbuffer_virtualaddr_t");
+	DLSYM(d->rga.lib, d->rga.process, "improcess");
+
+	return 0;
+}
+
+/****************************************************************************
+ * Name: det_load_model
+ *
+ * Description:
+ *   Load the .rknn file, learn the input geometry from the model rather than
+ *   assuming it, and pin inference to one NPU core.
+ *
+ *   One core because three were measured: 17.4ms on one, 10.0ms on all three.
+ *   Three times the hardware buys 1.74x, so pinning costs 30 percent latency and
+ *   leaves two cores entirely free - and the target rate is ten a second against
+ *   a single-core ceiling near fifty.
+ *
+ ****************************************************************************/
+
+static int det_load_model(struct detector *d, const char *path, uint32_t core)
+{
+	rknn_input_output_num io;
+	rknn_tensor_attr attr;
+	rknn_sdk_version ver;
+	FILE *fp;
+	long len;
+	uint32_t i;
+
+	fp = fopen(path, "rb");
+	if (fp == NULL) {
+		fprintf(stderr, "detector: %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+
+	if (fseek(fp, 0, SEEK_END) != 0 || (len = ftell(fp)) <= 0) {
+		fprintf(stderr, "detector: %s: cannot size the model\n", path);
+		fclose(fp);
+		return -1;
+	}
+
+	rewind(fp);
+	d->model = malloc((size_t)len);
+
+	if (d->model == NULL ||
+	    fread(d->model, 1, (size_t)len, fp) != (size_t)len) {
+		fprintf(stderr, "detector: %s: short read\n", path);
+		fclose(fp);
+		return -1;
+	}
+
+	fclose(fp);
+
+	if (d->rk.init(&d->ctx, d->model, (uint32_t)len, 0, NULL) < 0) {
+		fprintf(stderr,
+			"detector: rknn_init failed. Check the driver came up:"
+			" dmesg | grep rknpu\n");
+		return -1;
+	}
+
+	memset(&ver, 0, sizeof(ver));
+	if (d->rk.query(d->ctx, RKNN_QUERY_SDK_VERSION, &ver,
+			sizeof(ver)) == 0)
+		printf("detector: rknn api %s, driver %s\n", ver.api_version,
+		       ver.drv_version);
+
+	memset(&io, 0, sizeof(io));
+	if (d->rk.query(d->ctx, RKNN_QUERY_IN_OUT_NUM, &io, sizeof(io)) < 0) {
+		fprintf(stderr, "detector: IN_OUT_NUM failed\n");
+		return -1;
+	}
+
+	/* This decode is written for exactly one output layout: three heads with
+	 * three anchors each. Checked rather than assumed, because a different
+	 * model file would otherwise be decoded as if it were this one and produce
+	 * boxes that are wrong in a way nothing flags.
+	 */
+
+	if (io.n_input != 1 || io.n_output != YOLO_HEADS) {
+		fprintf(stderr,
+			"detector: model has %u inputs and %u outputs; this"
+			" decode handles 1 and %d\n",
+			io.n_input, io.n_output, YOLO_HEADS);
+		return -1;
+	}
+
+	d->n_out = io.n_output;
+
+	memset(&attr, 0, sizeof(attr));
+	attr.index = 0;
+	if (d->rk.query(d->ctx, RKNN_QUERY_INPUT_ATTR, &attr,
+			sizeof(attr)) < 0) {
+		fprintf(stderr, "detector: INPUT_ATTR failed\n");
+		return -1;
+	}
+
+	/* NHWC, so dims are 1,H,W,C. Taken from the model instead of hardcoded
+	 * 640x640: the file is what decides, and a mismatch here would show up as
+	 * a letterbox computed for the wrong target.
+	 */
+
+	if (attr.n_dims != 4 || attr.dims[3] != 3) {
+		fprintf(stderr,
+			"detector: input is not NHWC with 3 channels\n");
+		return -1;
+	}
+
+	d->in_h = attr.dims[1];
+	d->in_w = attr.dims[2];
+
+	printf("detector: model input %ux%ux3\n", d->in_w, d->in_h);
+
+	d->in_buf = malloc((size_t)d->in_w * d->in_h * 3);
+	if (d->in_buf == NULL) {
+		fprintf(stderr, "detector: out of memory for the input\n");
+		return -1;
+	}
+
+	/* The letterbox border, filled once. It never changes, so the per-frame
+	 * RGA operation only has to write the centre - which saves a second RGA
+	 * call every frame for a region whose contents are a constant.
+	 *
+	 * 114 is the grey yolov5 was trained to pad with.
+	 */
+
+	memset(d->in_buf, 114, (size_t)d->in_w * d->in_h * 3);
+
+	for (i = 0; i < d->n_out; i++) {
+		memset(&attr, 0, sizeof(attr));
+		attr.index = i;
+		if (d->rk.query(d->ctx, RKNN_QUERY_OUTPUT_ATTR, &attr,
+				sizeof(attr)) < 0) {
+			fprintf(stderr, "detector: OUTPUT_ATTR %u failed\n", i);
+			return -1;
+		}
+
+		if (attr.type != RKNN_TENSOR_INT8) {
+			fprintf(stderr,
+				"detector: output %u is not int8; this decode"
+				" dequantises affine int8 only\n", i);
+			return -1;
+		}
+
+		/* That head i really is the stride the anchor table assumes.
+		 *
+		 * The decode pairs output i with g_yolo_stride[i] and
+		 * g_yolo_anchor[i]. Nothing in the model file states that pairing,
+		 * so if an export ever ordered its heads the other way every box
+		 * would be decoded at the wrong scale with the wrong anchors -
+		 * and the result would be plausible-looking boxes in wrong places,
+		 * which is the failure mode least likely to be recognised for what
+		 * it is. The grid size is the one thing that distinguishes them.
+		 */
+
+		{
+			uint32_t gw = d->in_w / (uint32_t)g_yolo_stride[i];
+			uint32_t gh = d->in_h / (uint32_t)g_yolo_stride[i];
+
+			if (attr.n_dims != 4 ||
+			    attr.dims[1] != YOLO_ANCHORS * YOLO_PROPS ||
+			    attr.dims[2] != gh || attr.dims[3] != gw) {
+				fprintf(stderr,
+					"detector: output %u is %ux%ux%ux%u,"
+					" expected 1x%dx%ux%u for stride %d\n",
+					i, attr.dims[0], attr.dims[1],
+					attr.dims[2], attr.dims[3],
+					YOLO_ANCHORS * YOLO_PROPS, gh, gw,
+					g_yolo_stride[i]);
+				return -1;
+			}
+		}
+
+		d->out_zp[i] = attr.zp;
+		d->out_scale[i] = attr.scale;
+
+		/* size_with_stride, not size: the runtime writes padded rows -
+		 * 1638400 against a declared 1632000 for the first head - and a
+		 * buffer sized to the smaller figure is written past its end.
+		 */
+
+		d->out_size[i] = attr.size_with_stride > attr.size ?
+				 attr.size_with_stride : attr.size;
+		d->out_buf[i] = malloc(d->out_size[i]);
+
+		if (d->out_buf[i] == NULL) {
+			fprintf(stderr, "detector: out of memory for output"
+				" %u\n", i);
+			return -1;
+		}
+
+		memset(d->out_buf[i], 0, d->out_size[i]);
+	}
+
+	if (d->rk.set_core_mask(d->ctx, (rknn_core_mask)core) < 0)
+		fprintf(stderr,
+			"detector: set_core_mask(%u) failed - inference will"
+			" run wherever the runtime puts it\n", core);
+
+	return 0;
+}
+
+/****************************************************************************
+ * Name: det_letterbox_setup
+ *
+ * Description:
+ *   Work out once how the capture maps into the model's square input.
+ *
+ *   Both the forward mapping - what the RGA is told to do - and the inverse -
+ *   what the boxes go through afterwards - come from these three numbers. Keeping
+ *   them in one place is the point: computing the scale twice is how the picture
+ *   and the boxes end up disagreeing by a few percent, which looks like a
+ *   detector that is slightly bad rather than arithmetic that is wrong.
+ *
+ ****************************************************************************/
+
+static void det_letterbox_setup(struct detector *d, uint32_t sw, uint32_t sh)
+{
+	float sx = (float)d->in_w / (float)sw;
+	float sy = (float)d->in_h / (float)sh;
+
+	d->lb_scale = sx < sy ? sx : sy;
+	d->lb_w = (uint32_t)((float)sw * d->lb_scale);
+	d->lb_h = (uint32_t)((float)sh * d->lb_scale);
+
+	/* Even padding, as the reference does. An odd remainder goes to the far
+	 * side, which matters only for a pixel but matters for matching the
+	 * inverse transform exactly.
+	 */
+
+	d->lb_pad_x = (d->in_w - d->lb_w) / 2;
+	d->lb_pad_y = (d->in_h - d->lb_h) / 2;
+
+	printf("detector: letterbox %ux%u -> %ux%u at %u,%u inside %ux%u"
+	       " (scale %.4f)\n",
+	       sw, sh, d->lb_w, d->lb_h, d->lb_pad_x, d->lb_pad_y,
+	       d->in_w, d->in_h, (double)d->lb_scale);
+}
+
+/* Class names, for the log only.
+ *
+ * Optional on purpose: a missing labels file prints class numbers instead of
+ * refusing to detect. The names never reach the remote - the transport carries
+ * the class index - so this is a readability aid for whoever is watching the
+ * console, not part of the pipeline.
+ */
+
+static char g_yolo_label[YOLO_CLASSES][24];
+static bool g_yolo_labelled;
+
+static void det_load_labels(const char *path)
+{
+	char line[64];
+	FILE *fp;
+	int i = 0;
+
+	fp = fopen(path, "r");
+	if (fp == NULL) {
+		printf("detector: %s: %s - the log will show class numbers\n",
+		       path, strerror(errno));
+		return;
+	}
+
+	while (i < YOLO_CLASSES && fgets(line, sizeof(line), fp) != NULL) {
+		size_t n = strcspn(line, "\r\n");
+
+		line[n] = '\0';
+		if (n == 0)
+			continue;
+
+		/* Truncation is intended and stated in the format, rather than
+		 * left to snprintf: a plain %s here makes the compiler warn about
+		 * a 64-byte line reaching a 24-byte field, and silencing that by
+		 * widening the field would be responding to the diagnostic
+		 * instead of to what it is pointing at. No COCO name is close to
+		 * this long; a longer one is a wrong file, and a clipped name in
+		 * the log is the right way to find that out.
+		 */
+
+		snprintf(g_yolo_label[i], sizeof(g_yolo_label[i]), "%.*s",
+			 (int)(sizeof(g_yolo_label[i]) - 1), line);
+		i++;
+	}
+
+	fclose(fp);
+
+	if (i == YOLO_CLASSES) {
+		g_yolo_labelled = true;
+	} else {
+		printf("detector: %s has %d names, expected %d - the log will"
+		       " show class numbers\n", path, i, YOLO_CLASSES);
+	}
+}
+
+static const char *det_class_name(int cls, char *tmp, size_t len)
+{
+	if (g_yolo_labelled && cls >= 0 && cls < YOLO_CLASSES)
+		return g_yolo_label[cls];
+
+	snprintf(tmp, len, "cls%d", cls);
+	return tmp;
+}
+
+/****************************************************************************
+ * Name: det_rga
+ *
+ * Description:
+ *   Scale and colour-convert one captured frame into the model's input, in
+ *   hardware.
+ *
+ *   This is the one place in this program where the RGA earns its keep. The
+ *   display path deliberately does not use it: there the CPU costs 3.9ms against
+ *   the RGA's 0.6ms, a tenth of one core, and collecting it would mean making the
+ *   RGA write into a carveout mapped Device-nGnRnE. Here the alternative is not a
+ *   cheaper CPU conversion but 1280x720 NV12 resampled to 640x640 RGB888, which
+ *   is a different order of work, and the destination is ordinary malloc'd memory
+ *   with none of the carveout's mapping problems.
+ *
+ *   Only the letterboxed centre is written. The border was filled once at setup
+ *   and never changes, so asking the RGA to repaint it ten times a second would
+ *   be a second hardware operation per frame for a constant result.
+ *
+ ****************************************************************************/
+
+static int det_rga(struct detector *d, const uint8_t *nv12)
+{
+	rga_buffer_t src;
+	rga_buffer_t dst;
+	rga_buffer_t pat;
+	im_rect srect;
+	im_rect drect;
+	im_rect prect;
+	IM_STATUS st;
+
+	memset(&pat, 0, sizeof(pat));
+	memset(&prect, 0, sizeof(prect));
+
+	/* The source stride is the ISP's, not the width. S_FMT is read back
+	 * because the driver clamps sizes without saying so, which means the two
+	 * are not reliably equal - and using the width here would shear the image
+	 * in a way that still looks like a picture.
+	 */
+
+	src = d->rga.wrap((void *)nv12, (int)d->cam->src_w, (int)d->cam->src_h,
+			  (int)d->cam->src_ystride, (int)d->cam->src_h,
+			  RK_FORMAT_YCbCr_420_SP);
+
+	dst = d->rga.wrap(d->in_buf, (int)d->in_w, (int)d->in_h, (int)d->in_w,
+			  (int)d->in_h, RK_FORMAT_RGB_888);
+
+	srect.x = 0;
+	srect.y = 0;
+	srect.width = (int)d->cam->src_w;
+	srect.height = (int)d->cam->src_h;
+
+	drect.x = (int)d->lb_pad_x;
+	drect.y = (int)d->lb_pad_y;
+	drect.width = (int)d->lb_w;
+	drect.height = (int)d->lb_h;
+
+	st = d->rga.process(src, dst, pat, srect, drect, prect, IM_SYNC);
+	if (st != IM_STATUS_SUCCESS) {
+		fprintf(stderr, "detector: RGA failed (%d)\n", (int)st);
+		return -1;
+	}
+
+	return 0;
+}
+
+/****************************************************************************
+ * Name: det_infer
+ *
+ * Description:
+ *   Hand the prepared input to the NPU and collect the three heads.
+ *
+ *   The outputs are asked for as raw int8, want_float clear, because the decode
+ *   below dequantises only the few values that pass the confidence threshold.
+ *   Letting the runtime convert all 2.1 million to float first would be work
+ *   spent on numbers that are about to be discarded.
+ *
+ ****************************************************************************/
+
+static int det_infer(struct detector *d)
+{
+	rknn_output out[YOLO_HEADS];
+	rknn_input in;
+	uint32_t i;
+	int ret;
+
+	memset(&in, 0, sizeof(in));
+	in.index = 0;
+	in.type = RKNN_TENSOR_UINT8;
+	in.fmt = RKNN_TENSOR_NHWC;
+	in.size = d->in_w * d->in_h * 3;
+	in.buf = d->in_buf;
+
+	/* pass_through clear, so the runtime applies the model's own input
+	 * quantisation. Setting it would move that arithmetic here in exchange for
+	 * nothing - it is 645us either way, and the runtime's version cannot
+	 * disagree with the model about zero point and scale.
+	 */
+
+	in.pass_through = 0;
+
+	ret = d->rk.inputs_set(d->ctx, 1, &in);
+	if (ret < 0) {
+		fprintf(stderr, "detector: inputs_set: %d\n", ret);
+		return -1;
+	}
+
+	ret = d->rk.run(d->ctx, NULL);
+	if (ret < 0) {
+		fprintf(stderr, "detector: run: %d\n", ret);
+		return -1;
+	}
+
+	memset(out, 0, sizeof(out));
+	for (i = 0; i < d->n_out; i++) {
+		out[i].index = i;
+		out[i].want_float = 0;
+		out[i].is_prealloc = 1;
+		out[i].buf = d->out_buf[i];
+		out[i].size = d->out_size[i];
+	}
+
+	ret = d->rk.outputs_get(d->ctx, d->n_out, out, NULL);
+	if (ret < 0) {
+		fprintf(stderr, "detector: outputs_get: %d\n", ret);
+		return -1;
+	}
+
+	/* Released even though the buffers are ours. The header is explicit that
+	 * with is_prealloc set it will not free them, so this is here for whatever
+	 * internal bookkeeping a get creates, not for the memory.
+	 */
+
+	d->rk.outputs_release(d->ctx, d->n_out, out);
+
+	return 0;
+}
+
+/****************************************************************************
+ * Name: yolo_decode
+ *
+ * Description:
+ *   Turn one output head into candidate boxes.
+ *
+ *   The threshold is compared in the quantised domain, which is the whole reason
+ *   this is affordable on a CPU. Converting every one of 255x80x80 int8 values to
+ *   float and then comparing would be 1.6 million conversions for the first head
+ *   alone; mapping the threshold into int8 once makes the common case a single
+ *   byte compare, and only survivors get dequantised.
+ *
+ *   No sigmoid anywhere, which looks wrong against the yolov5 paper and is not:
+ *   this export has it baked in, so the dequantised values already are
+ *   probabilities. Applying it again would squash every score towards 0.5 and
+ *   quietly halve the detection rate - a failure that would look like a weak
+ *   model rather than a bug.
+ *
+ ****************************************************************************/
+
+static uint32_t yolo_decode(struct detector *d, uint32_t head, uint32_t got,
+			    float thresh)
+{
+	const int8_t *in = d->out_buf[head];
+	const int *anchor = g_yolo_anchor[head];
+	int stride = g_yolo_stride[head];
+	int32_t zp = d->out_zp[head];
+	float scale = d->out_scale[head];
+	uint32_t grid_w = d->in_w / (uint32_t)stride;
+	uint32_t grid_h = d->in_h / (uint32_t)stride;
+	uint32_t grid_len = grid_w * grid_h;
+	int8_t thres_i8;
+	float q;
+	uint32_t a;
+	uint32_t i;
+	uint32_t j;
+
+	/* The threshold, mapped into int8 exactly as the model's own values were.
+	 * Clipped because a small scale can put it outside the representable
+	 * range, and wrapping would silently turn a high threshold into a low one.
+	 */
+
+	q = thresh / scale + (float)zp;
+	if (q < -128.0f)
+		q = -128.0f;
+	if (q > 127.0f)
+		q = 127.0f;
+
+	thres_i8 = (int8_t)q;
+
+	for (a = 0; a < YOLO_ANCHORS; a++) {
+		for (i = 0; i < grid_h; i++) {
+			for (j = 0; j < grid_w; j++) {
+				const int8_t *p;
+				uint32_t base;
+				int8_t obj;
+				int8_t best;
+				int bestk;
+				int k;
+				float bx;
+				float by;
+				float bw;
+				float bh;
+
+				base = (YOLO_PROPS * a) * grid_len +
+				       i * grid_w + j;
+
+				obj = in[base + 4 * grid_len];
+				if (obj < thres_i8)
+					continue;
+
+				p = in + base;
+
+				/* Best class before any box arithmetic, so a cell
+				 * whose objectness passed but whose every class
+				 * failed costs only the scan.
+				 */
+
+				best = p[5 * grid_len];
+				bestk = 0;
+
+				for (k = 1; k < YOLO_CLASSES; k++) {
+					int8_t v = p[(5 + k) * grid_len];
+
+					if (v > best) {
+						best = v;
+						bestk = k;
+					}
+				}
+
+				if (best <= thres_i8)
+					continue;
+
+				if (got >= YOLO_MAX_CAND)
+					return got;
+
+				bx = ((float)p[0] - (float)zp) * scale;
+				by = ((float)p[grid_len] - (float)zp) * scale;
+				bw = ((float)p[2 * grid_len] - (float)zp) *
+				     scale;
+				bh = ((float)p[3 * grid_len] - (float)zp) *
+				     scale;
+
+				bx = (bx * 2.0f - 0.5f + (float)j) *
+				     (float)stride;
+				by = (by * 2.0f - 0.5f + (float)i) *
+				     (float)stride;
+
+				bw = bw * 2.0f;
+				bh = bh * 2.0f;
+				bw = bw * bw * (float)anchor[a * 2];
+				bh = bh * bh * (float)anchor[a * 2 + 1];
+
+				d->cand[got].x = bx - bw / 2.0f;
+				d->cand[got].y = by - bh / 2.0f;
+				d->cand[got].w = bw;
+				d->cand[got].h = bh;
+				d->cand[got].cls = bestk;
+				d->cand[got].keep = true;
+				d->cand[got].score =
+					(((float)best - (float)zp) * scale) *
+					(((float)obj - (float)zp) * scale);
+				got++;
+			}
+		}
+	}
+
+	return got;
+}
+
+/****************************************************************************
+ * Name: yolo_cmp
+ ****************************************************************************/
+
+static int yolo_cmp(const void *a, const void *b)
+{
+	const struct yolo_cand *x = a;
+	const struct yolo_cand *y = b;
+
+	if (x->score > y->score)
+		return -1;
+	if (x->score < y->score)
+		return 1;
+
+	return 0;
+}
+
+/****************************************************************************
+ * Name: yolo_nms
+ *
+ * Description:
+ *   Suppress overlapping boxes of the same class, highest score first.
+ *
+ *   One pass with a class comparison, rather than the reference's loop over all
+ *   80 classes calling a suppressor for each. The result is identical -
+ *   suppression only ever happens between boxes of the same class, so a single
+ *   ordered pass that skips mismatched pairs does exactly the same work - and it
+ *   avoids 80 traversals of a list that usually holds a handful of entries.
+ *
+ ****************************************************************************/
+
+static uint32_t yolo_nms(struct detector *d, uint32_t n, float thresh)
+{
+	uint32_t kept = 0;
+	uint32_t i;
+	uint32_t j;
+
+	qsort(d->cand, n, sizeof(d->cand[0]), yolo_cmp);
+
+	for (i = 0; i < n; i++) {
+		float x0;
+		float y0;
+		float x1;
+		float y1;
+		float a0;
+
+		if (!d->cand[i].keep)
+			continue;
+
+		kept++;
+
+		x0 = d->cand[i].x;
+		y0 = d->cand[i].y;
+		x1 = x0 + d->cand[i].w;
+		y1 = y0 + d->cand[i].h;
+
+		/* Areas and overlaps carry the reference's +1, which treats the
+		 * coordinates as inclusive pixel indices - a box from 10 to 20
+		 * covering eleven pixels rather than ten.
+		 *
+		 * For continuous box coordinates that is arguably wrong, and it is
+		 * kept anyway, because it is not independent of the threshold
+		 * above it. The +1 inflates every IoU slightly, most of all for
+		 * small boxes, and 0.45 was chosen against inflated numbers.
+		 * Dropping the +1 while keeping 0.45 silently makes suppression
+		 * less aggressive, which shows up as duplicate boxes on one
+		 * object - and it was measured: without this, three of twenty
+		 * random tensors produced a different set of survivors than the
+		 * reference. Changing the convention is a retune, not a cleanup.
+		 */
+
+		a0 = (x1 - x0 + 1.0f) * (y1 - y0 + 1.0f);
+
+		for (j = i + 1; j < n; j++) {
+			float jx0;
+			float jy0;
+			float jx1;
+			float jy1;
+			float ix;
+			float iy;
+			float inter;
+			float uni;
+
+			if (!d->cand[j].keep ||
+			    d->cand[j].cls != d->cand[i].cls)
+				continue;
+
+			jx0 = d->cand[j].x;
+			jy0 = d->cand[j].y;
+			jx1 = jx0 + d->cand[j].w;
+			jy1 = jy0 + d->cand[j].h;
+
+			ix = fminf(x1, jx1) - fmaxf(x0, jx0) + 1.0f;
+			iy = fminf(y1, jy1) - fmaxf(y0, jy0) + 1.0f;
+
+			if (ix <= 0.0f || iy <= 0.0f)
+				continue;
+
+			inter = ix * iy;
+			uni = a0 + (jx1 - jx0 + 1.0f) * (jy1 - jy0 + 1.0f) -
+			      inter;
+
+			if (uni > 0.0f && inter / uni > thresh)
+				d->cand[j].keep = false;
+		}
+	}
+
+	return kept;
+}
+
+/****************************************************************************
+ * Name: det_emit
+ *
+ * Description:
+ *   Map surviving boxes out of the model's letterboxed square into the published
+ *   frame's coordinates.
+ *
+ *   Two transforms collapsed into one factor. The boxes are in 640x640 model
+ *   pixels and the remote needs them in the 512x288 frame it is drawing. Going
+ *   via the 1280x720 capture would mean two multiplies and two roundings, and the
+ *   letterboxed image width is by construction exactly what the published width
+ *   maps to, so a single factor covers both stages and there is no intermediate
+ *   to round twice.
+ *
+ *   Clamped to the letterboxed image rather than to the whole model input. The
+ *   reference clamps to model_in_w/h, which in a padded dimension lets a box
+ *   reach into the border and emerge beyond the source height: 640 clamped then
+ *   divided by 0.5 gives 1280 where the capture is only 720 tall. Nothing is ever
+ *   detected in the padding so this costs nothing, and a box hanging off the
+ *   bottom of the frame is exactly the sort of thing that would be blamed on the
+ *   remote's drawing code.
+ *
+ ****************************************************************************/
+
+static uint32_t det_emit(struct detector *d, uint32_t n,
+			 struct amp_det_box *box)
+{
+	float kx = (float)d->width / (float)d->lb_w;
+	float ky = (float)d->height / (float)d->lb_h;
+	uint32_t out = 0;
+	uint32_t i;
+
+	for (i = 0; i < n && out < AMP_DET_MAXBOX; i++) {
+		float x0;
+		float y0;
+		float x1;
+		float y1;
+		float s;
+
+		if (!d->cand[i].keep)
+			continue;
+
+		x0 = d->cand[i].x - (float)d->lb_pad_x;
+		y0 = d->cand[i].y - (float)d->lb_pad_y;
+		x1 = x0 + d->cand[i].w;
+		y1 = y0 + d->cand[i].h;
+
+		x0 = fmaxf(0.0f, fminf(x0, (float)d->lb_w));
+		y0 = fmaxf(0.0f, fminf(y0, (float)d->lb_h));
+		x1 = fmaxf(0.0f, fminf(x1, (float)d->lb_w));
+		y1 = fmaxf(0.0f, fminf(y1, (float)d->lb_h));
+
+		x0 *= kx;
+		y0 *= ky;
+		x1 *= kx;
+		y1 *= ky;
+
+		/* Anything that clamped away to nothing is dropped rather than
+		 * published as a zero-sized box. The remote would draw a dot,
+		 * which reads as a broken detector rather than as a box that was
+		 * entirely off-frame.
+		 */
+
+		if (x1 - x0 < 1.0f || y1 - y0 < 1.0f)
+			continue;
+
+		s = d->cand[i].score * 100.0f;
+		if (s < 0.0f)
+			s = 0.0f;
+		if (s > 100.0f)
+			s = 100.0f;
+
+		/* Compared after the conversion to whole percent, so what gets
+		 * dropped is exactly the number that would have been published.
+		 * Filtering the float instead would let a box the log calls 35%
+		 * be rejected by a threshold of 35.
+		 */
+
+		if ((uint32_t)s < d->min_score) {
+			d->filtered++;
+			continue;
+		}
+
+		box[out].x = (uint16_t)x0;
+		box[out].y = (uint16_t)y0;
+		box[out].w = (uint16_t)(x1 - x0);
+		box[out].h = (uint16_t)(y1 - y0);
+		box[out].cls = (uint8_t)d->cand[i].cls;
+		box[out].score = (uint8_t)s;
+		box[out].reserved = 0;
+		out++;
+	}
+
+	return out;
+}
+
+/****************************************************************************
+ * Name: det_real
+ *
+ * Description:
+ *   One captured frame, all the way to a set of boxes.
+ *
+ *   Every phase timed separately. That is not thoroughness for its own sake: on
+ *   this task a single total has already pointed the diagnosis at the wrong
+ *   component twice, and the budget here is a sum of parts with very different
+ *   sizes - 2.7ms of RGA, 18ms of NPU including input marshalling, and a
+ *   post-processing pass whose cost is unknown until it runs. If the frame rate
+ *   ever disappoints, only the split says which one moved.
+ *
+ ****************************************************************************/
+
+static uint32_t det_real(struct detector *d, struct amp_det_box *box,
+			 const uint8_t *nv12)
+{
+	struct timespec t0;
+	struct timespec t1;
+	struct timespec t2;
+	struct timespec t3;
+	uint32_t cand = 0;
+	uint32_t out;
+	uint32_t i;
+	long us;
+
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+
+	if (det_rga(d, nv12) < 0)
+		return 0;
+
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+
+	if (det_infer(d) < 0)
+		return 0;
+
+	clock_gettime(CLOCK_MONOTONIC, &t2);
+
+	for (i = 0; i < d->n_out; i++)
+		cand = yolo_decode(d, i, cand, YOLO_BOX_THRESH);
+
+	yolo_nms(d, cand, YOLO_NMS_THRESH);
+
+	out = det_emit(d, cand, box);
+
+	clock_gettime(CLOCK_MONOTONIC, &t3);
+
+	/* inputs_set and run are not split here even though the probe split them:
+	 * rknn_run is synchronous and the two are adjacent, so the pair is what a
+	 * caller could act on. The RGA and the post-processing are the halves worth
+	 * separating, because they are the two that could actually be removed - one
+	 * by a different capture format, the other by the zero-copy API.
+	 */
+
+	us = (t1.tv_sec - t0.tv_sec) * 1000000 +
+	     (t1.tv_nsec - t0.tv_nsec) / 1000;
+	d->rga_us_sum += (uint64_t)us;
+	if ((uint32_t)us > d->rga_us_max)
+		d->rga_us_max = (uint32_t)us;
+
+	us = (t2.tv_sec - t1.tv_sec) * 1000000 +
+	     (t2.tv_nsec - t1.tv_nsec) / 1000;
+	d->run_us_sum += (uint64_t)us;
+	if ((uint32_t)us > d->run_us_max)
+		d->run_us_max = (uint32_t)us;
+
+	us = (t3.tv_sec - t2.tv_sec) * 1000000 +
+	     (t3.tv_nsec - t2.tv_nsec) / 1000;
+	d->post_us_sum += (uint64_t)us;
+	if ((uint32_t)us > d->post_us_max)
+		d->post_us_max = (uint32_t)us;
+
+	d->inferences++;
+	d->cands_max = cand > d->cands_max ? cand : d->cands_max;
+
+	if (out > d->boxes_max)
+		d->boxes_max = out;
+
+	return out;
+}
+
+/****************************************************************************
+ * Name: det_capture
+ *
+ * Description:
+ *   Take the newest frame from the detector's own stream, run it, and put the
+ *   buffer back.
+ *
+ *   The newest, not the oldest. This thread runs at a third of the capture rate,
+ *   so everything queued behind the latest frame is stale by definition. Draining
+ *   to the end and using the last one keeps the boxes as current as the NPU
+ *   allows; taking them in order would build a lag that grows without bound and
+ *   looks like a slow detector rather than a backed-up queue.
+ *
+ ****************************************************************************/
+
+static uint32_t det_capture(struct detector *d, struct amp_det_box *box)
+{
+	enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+	struct camera *c = d->cam;
+	struct v4l2_buffer newest;
+	struct v4l2_plane nplanes[VIDEO_MAX_PLANES];
+	bool have = false;
+	uint32_t count = 0;
+
+	for (; ; ) {
+		struct v4l2_buffer buf;
+		struct v4l2_plane planes[VIDEO_MAX_PLANES];
+
+		memset(&buf, 0, sizeof(buf));
+		memset(planes, 0, sizeof(planes));
+		buf.type = type;
+		buf.memory = V4L2_MEMORY_MMAP;
+		buf.m.planes = planes;
+		buf.length = VIDEO_MAX_PLANES;
+
+		if (ioctl(c->fd, VIDIOC_DQBUF, &buf) < 0) {
+			if (errno == EAGAIN)
+				break;
+
+			if (errno == EINTR) {
+				if (d->stop || g_stop)
+					break;
+
+				continue;
+			}
+
+			fprintf(stderr, "%s: DQBUF: %s\n", c->name,
+				strerror(errno));
+			break;
+		}
+
+		if (c->v4l2_seq_valid && buf.sequence != c->v4l2_seq + 1) {
+			c->gaps++;
+			c->gap_frames += buf.sequence - c->v4l2_seq - 1;
+		}
+
+		c->v4l2_seq = buf.sequence;
+		c->v4l2_seq_valid = true;
+		c->published++;
+
+		/* A superseded frame goes straight back, so the ISP keeps its
+		 * ring full while this one is being worked on.
+		 */
+
+		if (have && ioctl(c->fd, VIDIOC_QBUF, &newest) < 0)
+			fprintf(stderr, "%s: QBUF: %s\n", c->name,
+				strerror(errno));
+
+		memcpy(&newest, &buf, sizeof(newest));
+		memcpy(nplanes, planes, sizeof(nplanes));
+		newest.m.planes = nplanes;
+		have = true;
+	}
+
+	if (!have)
+		return 0;
+
+	if (newest.index < c->nbuffers)
+		count = det_real(d, box, c->buf[newest.index].start);
+
+	if (ioctl(c->fd, VIDIOC_QBUF, &newest) < 0)
+		fprintf(stderr, "%s: QBUF: %s\n", c->name, strerror(errno));
+
+	return count;
+}
+
+/****************************************************************************
+ * Name: det_release
+ *
+ * Description:
+ *   Give back everything the detector acquired.
+ *
+ *   Written to be safe to call twice, and called from the setup failure path as
+ *   well as from the shutdown one. Setup can fail after the context exists and
+ *   after ten megabytes of tensor buffers have been allocated, and that path does
+ *   not reach det_stop() - the thread never started, so there is nothing to stop.
+ *   Leaving the NPU context open in particular is worse than leaking the memory:
+ *   the process stays alive afterwards, drawing camera frames, still holding a
+ *   core that nothing else can then use.
+ *
+ ****************************************************************************/
+
+static void det_release(struct detector *d)
+{
+	uint32_t i;
+
+	if (d->ctx != 0) {
+		d->rk.destroy(d->ctx);
+		d->ctx = 0;
+	}
+
+	free(d->model);
+	d->model = NULL;
+
+	free(d->in_buf);
+	d->in_buf = NULL;
+
+	for (i = 0; i < YOLO_HEADS; i++) {
+		free(d->out_buf[i]);
+		d->out_buf[i] = NULL;
+	}
+
+	/* The libraries last, once every pointer into them is gone. */
+
+	if (d->rga.lib != NULL) {
+		dlclose(d->rga.lib);
+		d->rga.lib = NULL;
+	}
+
+	if (d->rk.lib != NULL) {
+		dlclose(d->rk.lib);
+		d->rk.lib = NULL;
+	}
+}
+
+#endif /* AMP_WITH_RKNN */
+
 /****************************************************************************
  * Name: det_synth
  *
@@ -2271,6 +3508,9 @@ static void *det_thread(void *arg)
 {
 	struct detector *d = arg;
 	uint32_t tick = 0;
+#ifdef AMP_WITH_RKNN
+	time_t last_log = 0;
+#endif
 
 	/* Ten a second, which is the rate the design assumes and roughly what one
 	 * NPU core sustains once RGA and post-processing are added. Deliberately
@@ -2288,8 +3528,28 @@ static void *det_thread(void *arg)
 
 		clock_gettime(CLOCK_MONOTONIC, &t0);
 
-		if (d->synthetic)
+		if (d->synthetic) {
 			count = det_synth(d, box, tick);
+		}
+#ifdef AMP_WITH_RKNN
+		else {
+			/* Waited for here rather than in the main loop's poll,
+			 * because this thread owns the stream. A frame arriving
+			 * while an inference is in flight simply waits in the
+			 * ring - which is the behaviour wanted, since only the
+			 * newest one will be used.
+			 */
+
+			struct pollfd pfd;
+
+			pfd.fd = d->cam->fd;
+			pfd.events = POLLIN;
+			pfd.revents = 0;
+
+			if (poll(&pfd, 1, 1000) > 0 && (pfd.revents & POLLIN))
+				count = det_capture(d, box);
+		}
+#endif
 
 		clock_gettime(CLOCK_MONOTONIC, &t1);
 
@@ -2298,8 +3558,43 @@ static void *det_thread(void *arg)
 
 		det_publish(d, box, count, (uint32_t)us);
 
+		/* Say what was found, at most once a second.
+		 *
+		 * Not every set: ten a second with a handful of boxes each would
+		 * bury everything else on the console. Not never either - with no
+		 * log at all, an empty screen cannot be told apart from a
+		 * detector that is running and finding nothing, and those have
+		 * completely different causes.
+		 */
+
+#ifdef AMP_WITH_RKNN
+		if (!d->synthetic && count > 0 && t1.tv_sec != last_log) {
+			char tmp[16];
+			uint32_t k;
+
+			last_log = t1.tv_sec;
+
+			printf("detector: %u in %ldms:", count, us / 1000);
+
+			for (k = 0; k < count && k < 6; k++)
+				printf(" %s(%u%%)",
+				       det_class_name(box[k].cls, tmp,
+						      sizeof(tmp)),
+				       box[k].score);
+
+			printf("%s\n", count > 6 ? " ..." : "");
+		}
+#endif
+
 		tick++;
-		usleep(100000);
+
+		/* Only the synthetic path paces itself. Real inference is already
+		 * slower than the target interval, so sleeping after it would
+		 * subtract from a rate that is the thing being measured.
+		 */
+
+		if (d->synthetic)
+			usleep(100000);
 	}
 
 	return NULL;
@@ -2310,7 +3605,9 @@ static void *det_thread(void *arg)
  ****************************************************************************/
 
 static int det_start(struct detector *d, volatile uint8_t *shm, uint32_t width,
-		     uint32_t height, int rpfd, bool synthetic)
+		     uint32_t height, int rpfd, bool synthetic,
+		     struct camera *cam, const char *model, const char *labels,
+		     uint32_t core, uint32_t min_score)
 {
 	d->desc = (volatile struct amp_det_desc *)(shm + AMP_DET_DESC_OFFSET);
 	d->width = width;
@@ -2318,6 +3615,52 @@ static int det_start(struct detector *d, volatile uint8_t *shm, uint32_t width,
 	d->rpfd = rpfd;
 	d->synthetic = synthetic;
 	d->stop = false;
+
+	if (!synthetic) {
+#ifdef AMP_WITH_RKNN
+		d->min_score = min_score;
+
+		if (cam == NULL || cam->fd < 0) {
+			fprintf(stderr,
+				"detector: real inference needs the second ISP"
+				" stream, which did not open\n");
+			return -1;
+		}
+
+		d->cam = cam;
+
+		if (det_load_libs(d) < 0 ||
+		    det_load_model(d, model, core) < 0) {
+			det_release(d);
+			return -1;
+		}
+
+		det_load_labels(labels);
+		det_letterbox_setup(d, cam->src_w, cam->src_h);
+
+		/* Stated at startup, because a threshold is the first thing to
+		 * suspect when the screen has fewer boxes than expected - and
+		 * silence here would make it the last thing anyone checked.
+		 */
+
+		printf("detector: publishing boxes at %u%% confidence and"
+		       " above\n", d->min_score);
+#else
+		(void)cam;
+		(void)model;
+		(void)labels;
+		(void)core;
+		(void)min_score;
+
+		fprintf(stderr,
+			"detector: this binary was built without inference"
+			" support.\n"
+			"  Rebuild with -DAMP_WITH_RKNN and the vendor headers on"
+			" the include path,\n"
+			"  or use -a for the synthetic transport self-test.\n");
+		return -1;
+#endif
+	}
 
 	/* Geometry and an even sequence number before the magic, so the remote
 	 * cannot find the magic and then read a block that has not been set up -
@@ -2381,6 +3724,42 @@ static void det_stop(struct detector *d)
 
 	printf("detector: %u sets published, %u doorbells failed\n",
 	       d->published, d->notify_fail);
+
+#ifdef AMP_WITH_RKNN
+
+	/* Means alongside maxima, for the reason every measurement in this program
+	 * now reports both: a worst case cannot tell a phase that always costs
+	 * 20ms from one that costs 3ms and was descheduled once, and that
+	 * distinction has already misdirected this work five times.
+	 */
+
+	if (d->inferences > 0) {
+		uint32_t n = d->inferences;
+
+		printf("detector: %u inferences | rga %lu/%u  npu %lu/%u  post"
+		       " %lu/%u us (mean/max)\n",
+		       n,
+		       (unsigned long)(d->rga_us_sum / n), d->rga_us_max,
+		       (unsigned long)(d->run_us_sum / n), d->run_us_max,
+		       (unsigned long)(d->post_us_sum / n), d->post_us_max);
+
+		printf("detector: at most %u boxes published, %u candidates"
+		       " before NMS (ceiling %d)\n",
+		       d->boxes_max, d->cands_max, YOLO_MAX_CAND);
+
+		/* How much the confidence filter threw away, so its setting can
+		 * be judged instead of guessed at. A count in the thousands
+		 * against a handful published means the threshold is doing the
+		 * work; a count of zero means it is not earning its place.
+		 */
+
+		printf("detector: %u boxes dropped below %u%% confidence\n",
+		       d->filtered, d->min_score);
+	}
+
+	det_release(d);
+
+#endif
 }
 
 /****************************************************************************
@@ -2442,6 +3821,13 @@ static void usage(const char *prog)
 		"  -R WxH     second stream size (default 1280x720)\n"
 		"  -a         publish synthetic detections - a self-test of the\n"
 		"             results transport, with no inference at all\n"
+		"  -A         run real inference on the second stream. Takes it\n"
+		"             over from -D: the detector thread owns that queue\n"
+		"  -M file    .rknn model (default yolov5s-640-640.rknn)\n"
+		"  -L file    class name list, for the log only\n"
+		"  -N core    NPU core: 0, 1, 2, auto or all (default 0)\n"
+		"  -c pct     publish only boxes at this confidence or above\n"
+		"             (default 35; 0 shows everything the model emits)\n"
 		"\n"
 		"Lights the panel and forwards touch to the AMP core. With -C it\n"
 		"also captures from the ISP, converts each frame to XRGB8888 and\n"
@@ -2464,6 +3850,9 @@ int main(int argc, char **argv)
 	time_t cam_last_report = 0;
 	uint32_t cam_last_count = 0;
 	uint32_t det_last_count = 0;
+#ifdef AMP_WITH_RKNN
+	uint32_t det_last_inf = 0;
+#endif
 	const char *cam_dev = NULL;
 	const char *det_dev = NULL;
 	uint32_t det_w = 1280;
@@ -2471,6 +3860,27 @@ int main(int argc, char **argv)
 	bool want_detect = false;
 	struct detector ai;
 	bool want_synth = false;
+	bool want_ai = false;
+	const char *ai_model = "yolov5s-640-640.rknn";
+	const char *ai_labels = "model/coco_80_labels_list.txt";
+
+	/* Core 0, not auto. Measured: 17.4ms on one core against 10.0ms on all
+	 * three, so three times the hardware buys 1.74x. Pinning costs 30 percent
+	 * more latency than the best case and leaves two cores entirely free, which
+	 * is the right trade when the target is ten frames a second against a
+	 * single-core ceiling near fifty.
+	 */
+
+	uint32_t ai_core = 1;
+
+	/* 35 percent, chosen from measurement rather than taste. On this board 107
+	 * detections split cleanly: real people came out at 60 to 91 percent, and
+	 * everything under about 20 was furniture that was not there. 35 removes 56
+	 * percent of the boxes and five phantom classes entirely, at the cost of
+	 * three person detections that were all in the 25 to 34 band.
+	 */
+
+	uint32_t ai_minscore = 35;
 	uint32_t cam_w = AMP_CAM_DEF_WIDTH;
 	uint32_t cam_h = AMP_CAM_DEF_HEIGHT;
 	bool want_camera = false;
@@ -2493,7 +3903,8 @@ int main(int argc, char **argv)
 	cam.fd = -1;
 	det.fd = -1;
 
-	while ((opt = getopt(argc, argv, "d:T:qthCV:W:H:DS:R:a")) != -1) {
+	while ((opt = getopt(argc, argv,
+			     "d:T:qthCV:W:H:DS:R:aAM:L:N:c:")) != -1) {
 		switch (opt) {
 		case 'd':
 			card = optarg;
@@ -2534,6 +3945,67 @@ int main(int argc, char **argv)
 
 			want_synth = true;
 			want_camera = true;
+			break;
+		case 'A':
+
+			/* Real inference. Implies the second stream, because the
+			 * detector reads from it directly - and unlike -D that
+			 * stream is then the thread's, not the poll loop's.
+			 */
+
+			want_ai = true;
+			want_detect = true;
+			want_camera = true;
+			break;
+		case 'M':
+			ai_model = optarg;
+			want_ai = true;
+			want_detect = true;
+			want_camera = true;
+			break;
+		case 'L':
+			ai_labels = optarg;
+			break;
+		case 'c': {
+			/* Range-checked, because a threshold above 100 would
+			 * suppress every box and look exactly like a detector
+			 * that had stopped finding anything.
+			 */
+
+			unsigned long v;
+			char *end;
+
+			v = strtoul(optarg, &end, 10);
+			if (*end != '\0' || v > 100) {
+				fprintf(stderr,
+					"-c wants a percentage, 0 to 100\n");
+				return EXIT_FAILURE;
+			}
+
+			ai_minscore = (uint32_t)v;
+			break;
+		}
+		case 'N':
+
+			/* Named rather than a raw bitmask. The mask that means
+			 * "core 2" is 4, and a -N 2 that quietly selected core 1
+			 * would make a per-core comparison wrong in a way the
+			 * output would not show.
+			 */
+
+			if (strcmp(optarg, "auto") == 0) {
+				ai_core = 0;
+			} else if (strcmp(optarg, "all") == 0) {
+				ai_core = 7;
+			} else if (optarg[0] >= '0' && optarg[0] <= '2' &&
+				   optarg[1] == '\0') {
+				ai_core = 1u << (optarg[0] - '0');
+			} else {
+				fprintf(stderr,
+					"-N wants 0, 1, 2, auto or all\n");
+				return EXIT_FAILURE;
+			}
+
 			break;
 		case 'S':
 			det_dev = optarg;
@@ -2797,10 +4269,22 @@ int main(int argc, char **argv)
 	 * Not fatal either, for the reason everything else here is not fatal.
 	 */
 
-	if (want_synth && cam.fd >= 0) {
-		if (det_start(&ai, shm, cam.out_w, cam.out_h, rpfd, true) < 0)
+	if ((want_synth || want_ai) && cam.fd >= 0) {
+		/* Real inference wins if both were asked for. -a exists to test
+		 * the transport with nothing else moving, so running it alongside
+		 * the real thing would put two producers on one block.
+		 */
+
+		if (want_ai && want_synth)
+			fprintf(stderr,
+				"-A and -a together: running real inference,"
+				" ignoring -a\n");
+
+		if (det_start(&ai, shm, cam.out_w, cam.out_h, rpfd, !want_ai,
+			      &det, ai_model, ai_labels, ai_core,
+			      ai_minscore) < 0)
 			fprintf(stderr, "detector will NOT run\n");
-	} else if (want_synth) {
+	} else if (want_synth || want_ai) {
 		fprintf(stderr,
 			"detector needs the camera - boxes are in the published"
 			" frame's coordinates\n");
@@ -2847,7 +4331,24 @@ int main(int argc, char **argv)
 			nfds++;
 		}
 
-		if (det.fd >= 0) {
+		/* Not polled here when the detector has it.
+		 *
+		 * Two consumers on one V4L2 queue would race for buffers, and the
+		 * loser would either block the display loop or hand the detector
+		 * a buffer that had already been requeued. The thread is the sole
+		 * consumer in that mode, so this loop must not touch the fd at
+		 * all - which is also why -A and -D are different options rather
+		 * than one that does both.
+		 *
+		 * Keyed on whether the detector is actually running, not on
+		 * whether it was asked for. If it failed to start - no runtime,
+		 * no model file - the stream would otherwise be left with no
+		 * consumer at all, filling its ring once and then sitting there
+		 * looking like an ISP that had stopped. This way a failed
+		 * detector degrades to exactly what -D does.
+		 */
+
+		if (det.fd >= 0 && !ai.running) {
 			detidx = nfds;
 			pfd[nfds].fd = det.fd;
 			pfd[nfds].events = POLLIN;
@@ -2943,6 +4444,68 @@ int main(int argc, char **argv)
 
 					det_last_count = det.published;
 				}
+
+#ifdef AMP_WITH_RKNN
+
+				/* The detector, on its own line and printed
+				 * whether or not it found anything.
+				 *
+				 * This exists because the phase timings were
+				 * unreachable in practice. They were collected
+				 * per frame and printed only by det_stop(), and
+				 * this program is killed rather than asked to
+				 * exit - so four sets of measurements were
+				 * gathered and never once displayed. Exactly the
+				 * mistake of collecting counters and not
+				 * printing them, one layer further out.
+				 *
+				 * Unconditional on the box count for a second
+				 * reason: the per-detection log is gated on
+				 * finding something, so an empty room produces
+				 * total silence, which is indistinguishable from
+				 * a detector that has died. Liveness should be
+				 * stated, not inferred from the capture counter
+				 * still climbing - that inference requires
+				 * knowing which thread increments it.
+				 *
+				 * The counters are read without a lock. They are
+				 * written by the inference thread, so a mean
+				 * computed here can be off by at most one
+				 * sample if a read lands between a sum and the
+				 * count. That is worth accepting: the
+				 * alternative is a mutex in the inference path
+				 * for the benefit of a printf.
+				 */
+
+				if (ai.running && ai.inferences > 0) {
+					uint32_t n = ai.inferences;
+					uint32_t di = n - det_last_inf;
+
+					printf("detector: %u inferences"
+					       " (%lu.%lu/s) | rga %lu/%u"
+					       " npu %lu/%u post %lu/%u us |"
+					       " %u boxes max, %u dropped"
+					       " <%u%%\n",
+					       n,
+					       (unsigned long)(di / secs),
+					       (unsigned long)((di * 10 / secs)
+							       % 10),
+					       (unsigned long)(ai.rga_us_sum /
+							       n),
+					       ai.rga_us_max,
+					       (unsigned long)(ai.run_us_sum /
+							       n),
+					       ai.run_us_max,
+					       (unsigned long)(ai.post_us_sum /
+							       n),
+					       ai.post_us_max,
+					       ai.boxes_max, ai.filtered,
+					       ai.min_score);
+
+					det_last_inf = n;
+				}
+
+#endif
 
 				cam_last_report = now.tv_sec;
 				cam_last_count = cam.published;

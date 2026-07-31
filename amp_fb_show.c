@@ -4502,6 +4502,37 @@ int main(int argc, char **argv)
 					       ai.boxes_max, ai.filtered,
 					       ai.min_score);
 
+					/* Transport health and the candidate
+					 * ceiling, on their own line for the
+					 * same reason the second capture stream
+					 * gets one: a reader should not have to
+					 * work out which number belongs to
+					 * which concern.
+					 *
+					 * These three were left behind when the
+					 * timings were moved off det_stop() -
+					 * which never runs, since this program
+					 * is killed rather than asked to exit.
+					 * notify_fail is the one that mattered:
+					 * a counter that only ever records a
+					 * failure, printed nowhere.
+					 *
+					 * The ceiling is here because
+					 * yolo_decode() stops collecting when
+					 * the array fills and says nothing.
+					 * That is a reasonable thing to do and
+					 * an unreasonable thing to do quietly -
+					 * a scene busy enough to hit it loses
+					 * its weakest candidates before NMS
+					 * ever sees them.
+					 */
+
+					printf("detector: %u sets, %u"
+					       " doorbells failed | %u of %d"
+					       " candidates max\n",
+					       ai.published, ai.notify_fail,
+					       ai.cands_max, YOLO_MAX_CAND);
+
 					det_last_inf = n;
 				}
 

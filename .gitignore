@@ -21,3 +21,8 @@ amp_rga_probe
 # armbian/.kiro/board-changes/rk3588-evb7-v11.md for what goes in it and the
 # toolchain that builds the C++ parts.
 npu-a17/
+# Everything tests/run.sh generates: the functions it extracts from the real
+# sources with awk, and the binaries built from them. Derived, and deliberately
+# so - a committed copy of an extracted function is a copy that goes stale
+# silently, which is the failure mode the extraction exists to avoid.
+tests/build/

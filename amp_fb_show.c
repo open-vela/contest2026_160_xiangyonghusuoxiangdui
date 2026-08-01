@@ -329,6 +329,16 @@ struct display {
 
 static volatile sig_atomic_t g_stop;
 
+#ifdef AMP_WITH_RKNN
+
+/* Declared here and defined next to det_dump(), so the handler and the code that
+ * acts on it are not separated by two thousand lines.
+ */
+
+static void on_dump_signal(int sig);
+
+#endif
+
 static void on_signal(int sig)
 {
 	(void)sig;
@@ -1245,6 +1255,20 @@ struct camera {
 	uint32_t src_h;
 	uint32_t src_ystride;
 
+	/* And which YUV the ISP means by it.
+	 *
+	 * Recorded because the detector converts this to RGB and needs the matrix
+	 * and the range. The vendor demo is no guide here: it takes RGB out of
+	 * OpenCV and never converts YUV at all, so its RGA use never exercised
+	 * this. Getting it wrong does not break the picture, it shifts every colour
+	 * slightly - exactly the kind of fault that presents as a model which has
+	 * become inexplicably unsure of itself.
+	 */
+
+	uint32_t src_colorspace;
+	uint32_t src_quant;
+	uint32_t src_ycbcr;
+
 	/* What goes into shared memory */
 
 	uint32_t out_w;
@@ -1480,11 +1504,30 @@ static int cam_open(struct camera *c, const char *name, const char *cardwant,
 	c->src_w = fmt.fmt.pix_mp.width;
 	c->src_h = fmt.fmt.pix_mp.height;
 	c->src_ystride = fmt.fmt.pix_mp.plane_fmt[0].bytesperline;
+	c->src_colorspace = fmt.fmt.pix_mp.colorspace;
+	c->src_quant = fmt.fmt.pix_mp.quantization;
+	c->src_ycbcr = fmt.fmt.pix_mp.ycbcr_enc;
 	if (c->src_ystride == 0)
 		c->src_ystride = c->src_w;
 
 	printf("%s [%s]: capturing NV12 %ux%u, y stride %u\n",
 	       want, c->name, c->src_w, c->src_h, c->src_ystride);
+
+	/* The colour space, reported by number and by name where the name is one
+	 * that matters to the conversion. Printed for both streams even though only
+	 * the detector converts, because a disagreement between the two paths would
+	 * itself be worth knowing.
+	 */
+
+	printf("%s: colorspace %u (%s), quantization %u (%s), ycbcr_enc %u\n",
+	       c->name, c->src_colorspace,
+	       c->src_colorspace == V4L2_COLORSPACE_REC709 ? "REC709" :
+	       c->src_colorspace == V4L2_COLORSPACE_SMPTE170M ? "SMPTE170M/601" :
+	       c->src_colorspace == V4L2_COLORSPACE_DEFAULT ? "DEFAULT" : "other",
+	       c->src_quant,
+	       c->src_quant == V4L2_QUANTIZATION_FULL_RANGE ? "full" :
+	       c->src_quant == V4L2_QUANTIZATION_LIM_RANGE ? "limited" :
+	       "default", c->src_ycbcr);
 
 	if (c->src_w != req_w || c->src_h != req_h)
 		printf("  the ISP adjusted this from the requested %ux%u\n",
@@ -2149,6 +2192,33 @@ struct rga_fns {
 	rga_buffer_t (*wrap)(void *, int, int, int, int, int);
 	IM_STATUS (*process)(rga_buffer_t, rga_buffer_t, rga_buffer_t, im_rect,
 			     im_rect, im_rect, int);
+
+	/* The buffer import path, which is what makes the conversion cheap.
+	 *
+	 * Passing improcess() a virtual address means the driver walks this
+	 * process's page tables, pins the pages and builds an RGA MMU mapping over
+	 * them, then tears it all down again - on every call, because the RGA has
+	 * its own MMU and cannot use a CPU address. The probe measured that at
+	 * 2346us for a 1280x720 NV12 frame, 7us per page against 1.2 for ordinary
+	 * memory: a V4L2 capture buffer is dma-coherent and possibly VM_PFNMAP, so
+	 * it cannot take the fast get_user_pages path.
+	 *
+	 * Importing once per buffer replaces that with nothing, because a V4L2 MMAP
+	 * buffer is already dma-buf backed - the ISP DMAs into it, so its
+	 * scatter-gather table exists and its pages are already pinned.
+	 *
+	 * Only the im_handle_param_t forms are declared outside __cplusplus, and
+	 * those are the unmangled symbols in the library.
+	 *
+	 * Resolved but not required: an older librga without them costs 2.3ms a
+	 * frame, not the detector.
+	 */
+
+	rga_buffer_handle_t (*import_fd)(int, im_handle_param_t *);
+	rga_buffer_handle_t (*import_va)(void *, im_handle_param_t *);
+	rga_buffer_t (*wrap_handle)(rga_buffer_handle_t, int, int, int, int,
+				    int);
+	IM_STATUS (*release_handle)(rga_buffer_handle_t);
 };
 
 /* yolov5 output geometry. Not derived at run time because it is a property of
@@ -2325,6 +2395,49 @@ struct detector {
 	uint32_t min_score;
 	uint32_t filtered;
 
+	/* Where to write diagnostic frames, or NULL. See det_dump(). */
+
+	const char *dump;
+	uint32_t dumps;
+
+	/* dma-buf conversion, and the self-check that decides whether to trust it.
+	 *
+	 * The concern is cache coherency, and it is specific: in_buf is ordinary
+	 * cached memory, the RGA writes it by DMA, and the CPU reads it immediately
+	 * afterwards when rknn_inputs_set() marshals the input. Something has to
+	 * invalidate the CPU's copy in between. With a per-call wrap the driver
+	 * does it while importing; whether it still does with a persistent import is
+	 * an implementation detail of a closed library, and librga exposes no way to
+	 * ask for cache maintenance on its own - imsync() waits on a fence,
+	 * c_RkRgaFlush() submits work.
+	 *
+	 * So it is measured rather than reasoned about. For the first frames the
+	 * conversion runs twice, once each way, into two buffers that are then
+	 * compared byte for byte. That test needs no scene control and no focus,
+	 * which matters: an earlier attempt at this was judged by counting
+	 * detections, and the counts turned out to be dominated by a defocused lens
+	 * rather than by anything in the code.
+	 *
+	 * If the two disagree the fast path is abandoned automatically. An
+	 * optimisation that cannot prove itself should not be the one that ships.
+	 */
+
+	bool zerocopy_want;
+	bool zerocopy;
+	bool zerocopy_checked;
+	uint32_t verify_frames;
+	uint32_t verify_bad;
+	size_t verify_maxdiff;
+
+	int cam_dmafd[CAM_MAX_BUFFERS];
+	rga_buffer_handle_t cam_rgah[CAM_MAX_BUFFERS];
+	rga_buffer_handle_t in_rgah;
+
+	/* A second destination, used only while checking. */
+
+	uint8_t *in_buf2;
+	rga_buffer_handle_t in2_rgah;
+
 #endif
 };
 
@@ -2458,6 +2571,18 @@ static int det_load_libs(struct detector *d)
 	DLSYM(d->rga.lib, d->rga.wrap, "wrapbuffer_virtualaddr_t");
 	DLSYM(d->rga.lib, d->rga.process, "improcess");
 
+	/* Plain dlsym, not DLSYM: see struct rga_fns. Missing these is a slower
+	 * conversion, not a missing detector.
+	 */
+
+	*(void **)(&d->rga.import_fd) = dlsym(d->rga.lib, "importbuffer_fd");
+	*(void **)(&d->rga.import_va) = dlsym(d->rga.lib,
+					      "importbuffer_virtualaddr");
+	*(void **)(&d->rga.wrap_handle) = dlsym(d->rga.lib,
+						"wrapbuffer_handle_t");
+	*(void **)(&d->rga.release_handle) = dlsym(d->rga.lib,
+						   "releasebuffer_handle");
+
 	return 0;
 }
 
@@ -2580,7 +2705,32 @@ static int det_load_model(struct detector *d, const char *path, uint32_t core)
 	 * 114 is the grey yolov5 was trained to pad with.
 	 */
 
-	memset(d->in_buf, 114, (size_t)d->in_w * d->in_h * 3);
+	/* 128, which is what the vendor demo pads with - cv::Scalar(128,128,128)
+	 * is the default argument to its letterbox().
+	 *
+	 * Not 114, which is the yolov5 upstream convention and what this used at
+	 * first. The difference matters more than fourteen levels sounds: at
+	 * 1280x720 into a 640x640 square the padding is 140 rows top and bottom,
+	 * so 44 percent of what the model sees is this constant. And the thresholds
+	 * in this file were taken from that demo, so its padding belongs with them -
+	 * the same argument as the +1 in the IoU. Adopting half of a tuned set is
+	 * how a port ends up subtly worse than what it was ported from.
+	 */
+
+	memset(d->in_buf, 128, (size_t)d->in_w * d->in_h * 3);
+
+	/* The comparison buffer, allocated and pre-filled the same way so that a
+	 * difference between the two can only come from the conversion and never
+	 * from their starting contents.
+	 */
+
+	d->in_buf2 = malloc((size_t)d->in_w * d->in_h * 3);
+	if (d->in_buf2 == NULL) {
+		fprintf(stderr, "detector: out of memory for the input\n");
+		return -1;
+	}
+
+	memset(d->in_buf2, 128, (size_t)d->in_w * d->in_h * 3);
 
 	for (i = 0; i < d->n_out; i++) {
 		memset(&attr, 0, sizeof(attr));
@@ -2758,27 +2908,252 @@ static const char *det_class_name(int cls, char *tmp, size_t len)
 }
 
 /****************************************************************************
- * Name: det_rga
+ * Name: det_dump
+ *
+ * Description:
+ *   Write out what the camera produced and what the model was given.
+ *
+ *   This exists because two rounds of this task were spent inferring image
+ *   quality from detection statistics, and both inferences were wrong. Counting
+ *   boxes cannot separate a degraded image from a harder scene from a threshold
+ *   set too high: they all show up as fewer boxes. One look at the actual pixels
+ *   answers in seconds what a day of arithmetic could not.
+ *
+ *   Both ends, deliberately. The capture goes out as the Y plane in PGM and the
+ *   model input as PPM, so the fault is localised to before or after the RGA
+ *   rather than merely established to exist. A sane PGM with a wrong PPM is the
+ *   conversion; a wrong PGM is the sensor, the ISP or the scene.
+ *
+ *   Greyscale for the source because Y alone answers framing, exposure and
+ *   focus, and writing it needs no colour conversion - so this cannot fail in
+ *   the same way the thing it is diagnosing might.
+ *
+ *   PPM and PGM because they need no library and every viewer opens them. A
+ *   diagnostic that needs tooling to read is one that gets skipped.
+ *
+ ****************************************************************************/
+
+static volatile sig_atomic_t g_det_dump;
+
+static void on_dump_signal(int sig)
+{
+	(void)sig;
+	g_det_dump = 1;
+}
+
+static void det_dump(struct detector *d, const uint8_t *nv12, uint32_t seq)
+{
+	char path[256];
+	FILE *fp;
+	uint32_t y;
+
+	snprintf(path, sizeof(path), "%s-%03u-src.pgm", d->dump, seq);
+	fp = fopen(path, "wb");
+
+	if (fp == NULL) {
+		fprintf(stderr, "detector: %s: %s\n", path, strerror(errno));
+		return;
+	}
+
+	fprintf(fp, "P5\n%u %u\n255\n", d->cam->src_w, d->cam->src_h);
+
+	/* Row at a time, because the capture is padded: bytesperline is not
+	 * reliably the width, and writing it as one block would shear the image
+	 * and invent a defect that is not there.
+	 */
+
+	for (y = 0; y < d->cam->src_h; y++)
+		fwrite(nv12 + (size_t)y * d->cam->src_ystride, 1,
+		       d->cam->src_w, fp);
+
+	fclose(fp);
+
+	/* The whole NV12 as well, raw.
+	 *
+	 * The PGM above answers framing, exposure and focus, which is what it was
+	 * added for. It cannot answer which matrix and range the RGA used to decode
+	 * the colour, because that needs the chroma - and that question came up
+	 * immediately afterwards, with the ISP reporting full-range YUV and the RGA
+	 * left on IM_COLOR_SPACE_DEFAULT. With both planes the conversion can be
+	 * recomputed offline under each candidate and compared against the PPM,
+	 * which settles it without another A/B run on the board.
+	 *
+	 * Written with the padding removed so the file is exactly w*h*3/2 and any
+	 * tool can read it as plain NV12.
+	 */
+
+	snprintf(path, sizeof(path), "%s-%03u-src.nv12", d->dump, seq);
+	fp = fopen(path, "wb");
+
+	if (fp != NULL) {
+		for (y = 0; y < d->cam->src_h; y++)
+			fwrite(nv12 + (size_t)y * d->cam->src_ystride, 1,
+			       d->cam->src_w, fp);
+
+		for (y = 0; y < d->cam->src_h / 2; y++)
+			fwrite(nv12 + (size_t)d->cam->src_ystride *
+			       d->cam->src_h + (size_t)y * d->cam->src_ystride,
+			       1, d->cam->src_w, fp);
+
+		fclose(fp);
+	}
+
+	snprintf(path, sizeof(path), "%s-%03u-in.ppm", d->dump, seq);
+	fp = fopen(path, "wb");
+
+	if (fp == NULL) {
+		fprintf(stderr, "detector: %s: %s\n", path, strerror(errno));
+		return;
+	}
+
+	fprintf(fp, "P6\n%u %u\n255\n", d->in_w, d->in_h);
+	fwrite(d->in_buf, 1, (size_t)d->in_w * d->in_h * 3, fp);
+	fclose(fp);
+
+	printf("detector: dumped %s-%03u-{src.pgm,src.nv12,in.ppm}\n",
+	       d->dump, seq);
+}
+
+/****************************************************************************
+ * Name: det_import_buffers
+ *
+ * Description:
+ *   Export each capture buffer as a dma-buf and import it, along with both model
+ *   input buffers, into the RGA driver once.
+ *
+ *   All or nothing. A partial import would leave some frames on the fast path and
+ *   some on the slow one, and a mean over a mixture of two different operations
+ *   is the sort of number that sends a diagnosis in the wrong direction.
+ *
+ ****************************************************************************/
+
+static int det_import_buffers(struct detector *d)
+{
+	struct camera *c = d->cam;
+	im_handle_param_t param;
+	unsigned int i;
+
+	if (d->rga.import_fd == NULL || d->rga.import_va == NULL ||
+	    d->rga.wrap_handle == NULL || d->rga.release_handle == NULL) {
+		printf("detector: librga has no buffer import - conversion will"
+		       " map pages on every call\n");
+		return -1;
+	}
+
+	/* Zero, not -1, means "no descriptor": the detector struct is zeroed when
+	 * it is created and det_release() can be reached without this function
+	 * having run, so any other sentinel risks closing fd 0.
+	 */
+
+	for (i = 0; i < CAM_MAX_BUFFERS; i++)
+		d->cam_dmafd[i] = 0;
+
+	memset(&param, 0, sizeof(param));
+	param.width = d->in_w;
+	param.height = d->in_h;
+	param.format = RK_FORMAT_RGB_888;
+
+	d->in_rgah = d->rga.import_va(d->in_buf, &param);
+	d->in2_rgah = d->rga.import_va(d->in_buf2, &param);
+
+	if (d->in_rgah == 0 || d->in2_rgah == 0) {
+		printf("detector: importing the model input failed -"
+		       " conversion will map pages on every call\n");
+		goto undo;
+	}
+
+	/* Strides, not visible sizes. The ISP's row pitch is not reliably the
+	 * width - S_FMT is read back precisely because the driver clamps silently.
+	 */
+
+	memset(&param, 0, sizeof(param));
+	param.width = c->src_ystride;
+	param.height = c->src_h;
+	param.format = RK_FORMAT_YCbCr_420_SP;
+
+	for (i = 0; i < c->nbuffers; i++) {
+		struct v4l2_exportbuffer exp;
+
+		memset(&exp, 0, sizeof(exp));
+		exp.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+		exp.index = i;
+		exp.plane = 0;
+		exp.flags = O_CLOEXEC;
+
+		if (ioctl(c->fd, VIDIOC_EXPBUF, &exp) < 0) {
+			printf("detector: EXPBUF %u: %s - conversion will map"
+			       " pages on every call\n", i, strerror(errno));
+			goto undo;
+		}
+
+		d->cam_dmafd[i] = exp.fd;
+		d->cam_rgah[i] = d->rga.import_fd(exp.fd, &param);
+
+		if (d->cam_rgah[i] == 0) {
+			printf("detector: importing capture buffer %u failed -"
+			       " conversion will map pages on every call\n", i);
+			goto undo;
+		}
+	}
+
+	printf("detector: %u capture buffers imported as dma-buf, checking the"
+	       " conversion against the mapped path\n", c->nbuffers);
+
+	return 0;
+
+undo:
+	for (i = 0; i < CAM_MAX_BUFFERS; i++) {
+		if (d->cam_rgah[i] != 0)
+			d->rga.release_handle(d->cam_rgah[i]);
+
+		d->cam_rgah[i] = 0;
+
+		if (d->cam_dmafd[i] > 0)
+			close(d->cam_dmafd[i]);
+
+		d->cam_dmafd[i] = 0;
+	}
+
+	if (d->in_rgah != 0)
+		d->rga.release_handle(d->in_rgah);
+
+	if (d->in2_rgah != 0)
+		d->rga.release_handle(d->in2_rgah);
+
+	d->in_rgah = 0;
+	d->in2_rgah = 0;
+
+	return -1;
+}
+
+/****************************************************************************
+ * Name: det_rga_into
  *
  * Description:
  *   Scale and colour-convert one captured frame into the model's input, in
- *   hardware.
+ *   hardware, with the addressing mode and the destination given by the caller.
  *
  *   This is the one place in this program where the RGA earns its keep. The
  *   display path deliberately does not use it: there the CPU costs 3.9ms against
  *   the RGA's 0.6ms, a tenth of one core, and collecting it would mean making the
- *   RGA write into a carveout mapped Device-nGnRnE. Here the alternative is not a
- *   cheaper CPU conversion but 1280x720 NV12 resampled to 640x640 RGB888, which
- *   is a different order of work, and the destination is ordinary malloc'd memory
- *   with none of the carveout's mapping problems.
+ *   RGA write into a carveout mapped Device-nGnRnE. Here the alternative is
+ *   1280x720 NV12 resampled to 640x640 RGB888, a different order of work, and the
+ *   destination is ordinary memory with none of the carveout's problems.
  *
  *   Only the letterboxed centre is written. The border was filled once at setup
- *   and never changes, so asking the RGA to repaint it ten times a second would
- *   be a second hardware operation per frame for a constant result.
+ *   and never changes, so repainting it thirty times a second would be a second
+ *   hardware operation per frame for a constant.
+ *
+ *   Parameterised so the self-check can run both paths over the same frame. Both
+ *   ends switch together and never separately: handle mode is a property of the
+ *   whole request rather than of one buffer, and mixing a handle with a virtual
+ *   address was measured returning IM_STATUS_FAILED on every single call.
  *
  ****************************************************************************/
 
-static int det_rga(struct detector *d, const uint8_t *nv12)
+static int det_rga_into(struct detector *d, const uint8_t *nv12, uint32_t idx,
+			uint8_t *dstbuf, rga_buffer_handle_t dsth,
+			bool use_handle)
 {
 	rga_buffer_t src;
 	rga_buffer_t dst;
@@ -2797,12 +3172,59 @@ static int det_rga(struct detector *d, const uint8_t *nv12)
 	 * in a way that still looks like a picture.
 	 */
 
-	src = d->rga.wrap((void *)nv12, (int)d->cam->src_w, (int)d->cam->src_h,
-			  (int)d->cam->src_ystride, (int)d->cam->src_h,
-			  RK_FORMAT_YCbCr_420_SP);
+	if (use_handle) {
+		src = d->rga.wrap_handle(d->cam_rgah[idx], (int)d->cam->src_w,
+					 (int)d->cam->src_h,
+					 (int)d->cam->src_ystride,
+					 (int)d->cam->src_h,
+					 RK_FORMAT_YCbCr_420_SP);
 
-	dst = d->rga.wrap(d->in_buf, (int)d->in_w, (int)d->in_h, (int)d->in_w,
-			  (int)d->in_h, RK_FORMAT_RGB_888);
+		dst = d->rga.wrap_handle(dsth, (int)d->in_w, (int)d->in_h,
+					 (int)d->in_w, (int)d->in_h,
+					 RK_FORMAT_RGB_888);
+	} else {
+		src = d->rga.wrap((void *)nv12, (int)d->cam->src_w,
+				  (int)d->cam->src_h,
+				  (int)d->cam->src_ystride, (int)d->cam->src_h,
+				  RK_FORMAT_YCbCr_420_SP);
+
+		dst = d->rga.wrap(dstbuf, (int)d->in_w, (int)d->in_h,
+				  (int)d->in_w, (int)d->in_h,
+				  RK_FORMAT_RGB_888);
+	}
+
+	/* Nothing sets color_space_mode here, and that is a finding rather than an
+	 * omission.
+	 *
+	 * The RGA decodes this as BT.601 limited range. That was not read out of a
+	 * document - it was established by dumping a frame and its converted output,
+	 * converting the frame offline under all four candidate matrices, and finding
+	 * BT.601 limited matching to a mean absolute error of 0.40 levels while the
+	 * next candidate was three times worse.
+	 *
+	 * The ISP emits full range (rkisp.c:4914), so there is a genuine mismatch:
+	 * a limited-range decode of full-range data applies a gain of 255/219 and an
+	 * offset of -18.6, clipping the top 2 percent of pixels and stretching
+	 * contrast by 16 percent. Neither end can be moved from here:
+	 *
+	 *   - Setting src.color_space_mode is ignored by this improcess() path. That
+	 *     was measured the same way: a run with IM_YUV_TO_RGB_BT601_FULL still
+	 *     decoded as limited. An option to set it existed briefly and was
+	 *     removed, because an option that does nothing is worse than none.
+	 *
+	 *   - Asking the ISP for limited range does take on the subdev - see
+	 *     amp_isp_range - but does not reach the detect stream. In one run the
+	 *     display node reported limited and the detect node full, and the
+	 *     captured Y still reached 247, above the limited-range ceiling of 235.
+	 *     The value is read at three different moments by three different pieces
+	 *     of the driver and rkaiq_3A rewrites it in between, so making it stick
+	 *     means winning a race against a daemon we do not control.
+	 *
+	 * Left as it is deliberately. The measured cost is small next to what
+	 * matching the reference's padding recovered - peak person confidence went
+	 * from 69 to 89 percent on that change alone - and both remaining routes are
+	 * worse than the problem.
+	 */
 
 	srect.x = 0;
 	srect.y = 0;
@@ -2816,12 +3238,99 @@ static int det_rga(struct detector *d, const uint8_t *nv12)
 
 	st = d->rga.process(src, dst, pat, srect, drect, prect, IM_SYNC);
 	if (st != IM_STATUS_SUCCESS) {
-		fprintf(stderr, "detector: RGA failed (%d)\n", (int)st);
+		fprintf(stderr, "detector: RGA failed (%d)%s\n", (int)st,
+			use_handle ? " on the dma-buf path" : "");
 		return -1;
 	}
 
 	return 0;
 }
+
+/****************************************************************************
+ * Name: det_verify_zerocopy
+ *
+ * Description:
+ *   Convert one frame both ways and compare the results byte for byte.
+ *
+ *   This is the arbiter for the whole optimisation, and it is deliberately not a
+ *   detection count. Counting boxes conflates the model, the scene, the lens and
+ *   the confidence threshold: an earlier attempt at exactly this question was
+ *   decided by box counts that turned out to be dominated by a defocused lens,
+ *   and the conclusion drawn from them was wrong twice over. Two buffers and a
+ *   comparison have none of those confounds - the same frame either converts to
+ *   the same pixels or it does not, whatever the lens is doing.
+ *
+ *   Run over many frames rather than one, because the failure being looked for is
+ *   stale cache lines and staleness depends on what happens to be resident. A
+ *   single agreement would prove nothing.
+ *
+ *   The concern is specific: in_buf is ordinary cached memory, the RGA writes it
+ *   by DMA, and the CPU reads it immediately afterwards when rknn_inputs_set()
+ *   marshals the input. Something has to invalidate the CPU's copy in between.
+ *   With a per-call wrap the driver does it while importing; whether a persistent
+ *   import still does is an implementation detail of a closed library, and librga
+ *   offers no way to request cache maintenance on its own.
+ *
+ ****************************************************************************/
+
+static void det_verify_zerocopy(struct detector *d, const uint8_t *nv12,
+				uint32_t idx)
+{
+	size_t len = (size_t)d->in_w * d->in_h * 3;
+	size_t diff = 0;
+	size_t i;
+
+	/* The mapped path into in_buf first: that is the reference, and it is also
+	 * what this frame's inference will use while the check is still running.
+	 */
+
+	if (det_rga_into(d, nv12, idx, d->in_buf, 0, false) < 0)
+		return;
+
+	if (det_rga_into(d, nv12, idx, d->in_buf2, d->in2_rgah, true) < 0) {
+		printf("detector: the dma-buf conversion failed outright -"
+		       " staying on the mapped path\n");
+		d->zerocopy_checked = true;
+		d->zerocopy = false;
+		return;
+	}
+
+	for (i = 0; i < len; i++)
+		if (d->in_buf[i] != d->in_buf2[i])
+			diff++;
+
+	if (diff > 0) {
+		d->verify_bad++;
+
+		if (diff > d->verify_maxdiff)
+			d->verify_maxdiff = diff;
+	}
+
+	d->verify_frames++;
+
+	if (d->verify_frames < 60)
+		return;
+
+	d->zerocopy_checked = true;
+
+	if (d->verify_bad == 0) {
+		d->zerocopy = true;
+
+		printf("detector: dma-buf conversion matches the mapped path on"
+		       " %u frames - using it\n", d->verify_frames);
+	} else {
+		d->zerocopy = false;
+
+		printf("detector: dma-buf conversion differs on %u of %u"
+		       " frames, worst %zu of %zu bytes - staying on the mapped"
+		       " path\n", d->verify_bad, d->verify_frames,
+		       d->verify_maxdiff, len);
+		printf("detector:   cache maintenance is the likely reason; the"
+		       " fix is a dma-heap destination plus DMA_BUF_IOCTL_SYNC,"
+		       " not this\n");
+	}
+}
+
 
 /****************************************************************************
  * Name: det_infer
@@ -3247,7 +3756,7 @@ static uint32_t det_emit(struct detector *d, uint32_t n,
  ****************************************************************************/
 
 static uint32_t det_real(struct detector *d, struct amp_det_box *box,
-			 const uint8_t *nv12)
+			 const uint8_t *nv12, uint32_t idx)
 {
 	struct timespec t0;
 	struct timespec t1;
@@ -3260,7 +3769,15 @@ static uint32_t det_real(struct detector *d, struct amp_det_box *box,
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 
-	if (det_rga(d, nv12) < 0)
+	/* While the check is running the frame is converted twice, so the RGA
+	 * timing for those frames is meaningless - which is why the check is
+	 * bounded and reports once rather than running forever.
+	 */
+
+	if (d->zerocopy_want && !d->zerocopy_checked) {
+		det_verify_zerocopy(d, nv12, idx);
+	} else if (det_rga_into(d, nv12, idx, d->in_buf, d->in_rgah,
+				d->zerocopy) < 0)
 		return 0;
 
 	clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -3278,6 +3795,27 @@ static uint32_t det_real(struct detector *d, struct amp_det_box *box,
 	out = det_emit(d, cand, box);
 
 	clock_gettime(CLOCK_MONOTONIC, &t3);
+
+	/* Dumped after the timing is taken, so writing two files to storage does
+	 * not appear as a conversion that suddenly cost 30ms.
+	 *
+	 * One automatic dump a couple of seconds in, so there is always something
+	 * to look at, and then one per SIGUSR1 - because the frame worth seeing is
+	 * the one where a person was in view and no box appeared, and only whoever
+	 * is looking at the screen knows when that was.
+	 */
+
+	if (d->dump != NULL) {
+		bool now = g_det_dump != 0;
+
+		if (d->inferences == 60 && d->dumps == 0)
+			now = true;
+
+		if (now) {
+			g_det_dump = 0;
+			det_dump(d, nv12, ++d->dumps);
+		}
+	}
 
 	/* inputs_set and run are not split here even though the probe split them:
 	 * rknn_run is synchronous and the two are adjacent, so the pair is what a
@@ -3391,7 +3929,8 @@ static uint32_t det_capture(struct detector *d, struct amp_det_box *box)
 		return 0;
 
 	if (newest.index < c->nbuffers)
-		count = det_real(d, box, c->buf[newest.index].start);
+		count = det_real(d, box, c->buf[newest.index].start,
+				 newest.index);
 
 	if (ioctl(c->fd, VIDIOC_QBUF, &newest) < 0)
 		fprintf(stderr, "%s: QBUF: %s\n", c->name, strerror(errno));
@@ -3418,6 +3957,38 @@ static uint32_t det_capture(struct detector *d, struct amp_det_box *box)
 static void det_release(struct detector *d)
 {
 	uint32_t i;
+
+	/* RGA handles before the memory they describe, and before dlclose(). A
+	 * handle outliving its buffer would leave the driver holding a mapping onto
+	 * pages this process no longer owns.
+	 */
+
+	for (i = 0; i < CAM_MAX_BUFFERS; i++) {
+		if (d->cam_rgah[i] != 0 && d->rga.release_handle != NULL)
+			d->rga.release_handle(d->cam_rgah[i]);
+
+		d->cam_rgah[i] = 0;
+
+		if (d->cam_dmafd[i] > 0)
+			close(d->cam_dmafd[i]);
+
+		d->cam_dmafd[i] = 0;
+	}
+
+	if (d->rga.release_handle != NULL) {
+		if (d->in_rgah != 0)
+			d->rga.release_handle(d->in_rgah);
+
+		if (d->in2_rgah != 0)
+			d->rga.release_handle(d->in2_rgah);
+	}
+
+	d->in_rgah = 0;
+	d->in2_rgah = 0;
+	d->zerocopy = false;
+
+	free(d->in_buf2);
+	d->in_buf2 = NULL;
 
 	if (d->ctx != 0) {
 		d->rk.destroy(d->ctx);
@@ -3607,7 +4178,8 @@ static void *det_thread(void *arg)
 static int det_start(struct detector *d, volatile uint8_t *shm, uint32_t width,
 		     uint32_t height, int rpfd, bool synthetic,
 		     struct camera *cam, const char *model, const char *labels,
-		     uint32_t core, uint32_t min_score)
+		     uint32_t core, uint32_t min_score,
+		 const char *dump, bool zerocopy)
 {
 	d->desc = (volatile struct amp_det_desc *)(shm + AMP_DET_DESC_OFFSET);
 	d->width = width;
@@ -3619,6 +4191,23 @@ static int det_start(struct detector *d, volatile uint8_t *shm, uint32_t width,
 	if (!synthetic) {
 #ifdef AMP_WITH_RKNN
 		d->min_score = min_score;
+		d->dump = dump;
+		d->zerocopy_want = zerocopy;
+		/* The range the ISP emits against the range the conversion
+		 * assumes, stated once at startup.
+		 *
+		 * Printed because this took several rounds to find and cost two
+		 * broken attempts at unrelated things along the way. The RGA
+		 * decodes as BT.601 limited and so does the display path's CPU
+		 * loop; if the ISP says full, both are clipping highlights and
+		 * crushing shadows, and nothing else in the log would ever say
+		 * so. See det_rga_into() for why it is not simply corrected.
+		 */
+
+		if (cam->src_quant == V4L2_QUANTIZATION_FULL_RANGE)
+			printf("detector: NOTE the ISP emits full-range YUV but"
+			       " the conversion decodes BT.601 limited -"
+			       " highlights clip\n");
 
 		if (cam == NULL || cam->fd < 0) {
 			fprintf(stderr,
@@ -3645,12 +4234,24 @@ static int det_start(struct detector *d, volatile uint8_t *shm, uint32_t width,
 
 		printf("detector: publishing boxes at %u%% confidence and"
 		       " above\n", d->min_score);
+
+		/* Result ignored: failing to import costs 2.3ms a frame and
+		 * nothing else, and det_import_buffers() has already said which
+		 * reason applied. Clearing the request keeps the self-check from
+		 * running against handles that were never created.
+		 */
+
+		if (d->zerocopy_want && det_import_buffers(d) < 0)
+			d->zerocopy_want = false;
 #else
 		(void)cam;
 		(void)model;
 		(void)labels;
 		(void)core;
 		(void)min_score;
+		(void)dump;
+		(void)zerocopy;
+
 
 		fprintf(stderr,
 			"detector: this binary was built without inference"
@@ -3828,6 +4429,15 @@ static void usage(const char *prog)
 		"  -N core    NPU core: 0, 1, 2, auto or all (default 0)\n"
 		"  -c pct     publish only boxes at this confidence or above\n"
 		"             (default 35; 0 shows everything the model emits)\n"
+
+		"  -Z         try converting out of imported dma-buf handles\n"
+		"             instead of mapping pages every call. Checked\n"
+		"             against the mapped path over 60 frames first, and\n"
+		"             abandoned if the two disagree by a single byte\n"
+		"  -P prefix  write what the camera produced and what the model\n"
+		"             was given, as prefix-NNN-src.pgm and -in.ppm.\n"
+		"             One dump two seconds in, then one per SIGUSR1 -\n"
+		"             so the frame where a box was missing can be caught\n"
 		"\n"
 		"Lights the panel and forwards touch to the AMP core. With -C it\n"
 		"also captures from the ISP, converts each frame to XRGB8888 and\n"
@@ -3863,6 +4473,8 @@ int main(int argc, char **argv)
 	bool want_ai = false;
 	const char *ai_model = "yolov5s-640-640.rknn";
 	const char *ai_labels = "model/coco_80_labels_list.txt";
+	const char *ai_dump = NULL;
+	bool ai_zerocopy = false;
 
 	/* Core 0, not auto. Measured: 17.4ms on one core against 10.0ms on all
 	 * three, so three times the hardware buys 1.74x. Pinning costs 30 percent
@@ -3904,7 +4516,7 @@ int main(int argc, char **argv)
 	det.fd = -1;
 
 	while ((opt = getopt(argc, argv,
-			     "d:T:qthCV:W:H:DS:R:aAM:L:N:c:")) != -1) {
+			     "d:T:qthCV:W:H:DS:R:aAM:L:N:c:P:Z")) != -1) {
 		switch (opt) {
 		case 'd':
 			card = optarg;
@@ -3965,6 +4577,22 @@ int main(int argc, char **argv)
 			break;
 		case 'L':
 			ai_labels = optarg;
+			break;
+		case 'P':
+			ai_dump = optarg;
+			break;
+		case 'Z':
+
+			/* Opt-in, and it still has to pass its own check before
+			 * it is used. Two earlier attempts at this optimisation
+			 * shipped straight into the default path and both broke
+			 * a working detector - once by losing cache maintenance,
+			 * once by mixing addressing modes. Default off plus a
+			 * self-check is the difference between measuring an idea
+			 * and betting on it.
+			 */
+
+			ai_zerocopy = true;
 			break;
 		case 'c': {
 			/* Range-checked, because a threshold above 100 would
@@ -4071,6 +4699,19 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
+
+#ifdef AMP_WITH_RKNN
+
+	/* SIGUSR1 asks the detector for a frame dump rather than killing the
+	 * program, which is what the default disposition would do - and losing the
+	 * run is a poor response to being asked for a diagnostic. Installed
+	 * unconditionally so that a stray signal is harmless whether -P was given
+	 * or not.
+	 */
+
+	signal(SIGUSR1, on_dump_signal);
+
+#endif
 
 	/* The carveout is declared no-map, so it is not in the kernel's linear
 	 * map and /dev/mem is the way to reach it. Only the control block is
@@ -4282,7 +4923,7 @@ int main(int argc, char **argv)
 
 		if (det_start(&ai, shm, cam.out_w, cam.out_h, rpfd, !want_ai,
 			      &det, ai_model, ai_labels, ai_core,
-			      ai_minscore) < 0)
+			      ai_minscore, ai_dump, ai_zerocopy) < 0)
 			fprintf(stderr, "detector will NOT run\n");
 	} else if (want_synth || want_ai) {
 		fprintf(stderr,

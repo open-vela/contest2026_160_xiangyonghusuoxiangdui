@@ -101,7 +101,7 @@
 #include <linux/input.h>
 
 #define AMP_SHM_BASE       0x31000000UL
-#define AMP_SHM_SIZE       (4 * 1024 * 1024)
+#define AMP_SHM_SIZE       (8 * 1024 * 1024)
 /* Bumped with the layout - see the comment in evb7_amp_shm.h for why the version
  * field is not enough on its own.
  */
@@ -148,16 +148,16 @@
 #define AMP_SHM_HDR_SIZE     4096
 #define AMP_CAM_DESC_OFFSET  (AMP_SHM_HDR_OFFSET + AMP_SHM_HDR_SIZE)
 #define AMP_CAM_NBUFFERS     2
-#define AMP_CAM_SLOT_SIZE    0x100000
+#define AMP_CAM_SLOT_SIZE    0x200000
 #define AMP_CAM_BUF0_OFFSET  0x100000
-#define AMP_CAM_BUF1_OFFSET  0x200000
+#define AMP_CAM_BUF1_OFFSET  0x300000
 
 #define AMP_CAM_DEF_WIDTH    512
 #define AMP_CAM_DEF_HEIGHT   288
 #define AMP_CAM_BPP          4         /* XRGB8888, what the remote's fb is */
 
 #define AMP_CAM_MAGIC        0x314d4143u  /* "CAM1" */
-#define AMP_CAM_VERSION      1
+#define AMP_CAM_VERSION      2
 
 /* Detection results, in the page after the camera descriptor. Written here,
  * read by the remote.
@@ -1213,6 +1213,23 @@ struct cam_buffer {
 	size_t length;
 };
 
+/* Declared, not defined, here. The definition needs the vendor headers and lives
+ * with the rest of the RGA glue further down the file; a camera only ever holds a
+ * pointer to one.
+ */
+
+struct rga_fns;
+struct camera;
+
+#ifdef AMP_WITH_RKNN
+
+/* Defined below the RGA glue, called from cam_drain which sits above it. */
+
+static int cam_rotate(struct camera *c);
+static int cam_rotate_setup(struct camera *c, uint32_t out_w, uint32_t out_h);
+
+#endif
+
 struct camera {
 	const char *name;
 	int fd;
@@ -1268,6 +1285,37 @@ struct camera {
 	uint32_t src_colorspace;
 	uint32_t src_quant;
 	uint32_t src_ycbcr;
+
+	/* Rotation, in degrees, or zero for the CPU path.
+	 *
+	 * The panel is 1080x1920 portrait and the sensor is landscape, so a frame
+	 * shown unrotated occupies 28 percent of the screen with black bars above
+	 * and below. Rotating is the only way to fill it without cropping, and the
+	 * aspect ratios make that exact rather than approximate: 288/512 and
+	 * 540/960 are both 0.5625, so a rotated frame fits the remote's
+	 * framebuffer with nothing left over and nothing thrown away.
+	 *
+	 * 90 or 270 is a question about which way the screen gets turned to look
+	 * at it, not about correctness. The module is mounted for landscape - a
+	 * dumped frame shows a monitor whose text runs across the frame, which it
+	 * would not if the sensor were rotated - so either choice puts the world
+	 * on its side until the panel is turned.
+	 */
+
+	int rot;
+
+	/* An opaque pointer rather than the table itself, so that this structure
+	 * needs only a forward declaration of it.
+	 *
+	 * The alternative was hoisting the vendor headers and the whole RGA glue
+	 * above this definition, several hundred lines earlier in the file, purely
+	 * to satisfy a field. A pointer to an incomplete type costs one
+	 * indirection on a path that runs thirty times a second and leaves the
+	 * layout of everything else where it was.
+	 */
+
+	struct rga_fns *rga;
+	uint8_t *rotsrc;                /* NV12 staged for the RGA, see cam_rotate */
 
 	/* What goes into shared memory */
 
@@ -1630,11 +1678,34 @@ static int cam_publish_setup(struct camera *c, volatile uint8_t *shm,
 	c->out_w = out_w;
 	c->out_h = out_h;
 
-	/* Exactly what the conversion reads: the Y plane, then the interleaved
-	 * chroma plane at half the height.
+	/* The slot has to hold the frame, and this is the only place that knows
+	 * both numbers.
+	 *
+	 * Checked here rather than left to the remote, which does check and would
+	 * refuse - but per frame, silently, from the other core. A full-screen
+	 * frame is 2MB against slots that were 1MB until this change, so getting
+	 * this wrong is a live possibility rather than a theoretical one.
 	 */
 
-	bool resample = (c->src_w != out_w || c->src_h != out_h);
+	if ((size_t)out_w * out_h * AMP_CAM_BPP > AMP_CAM_SLOT_SIZE) {
+		fprintf(stderr,
+			"camera: %ux%u at %d bpp is %zu bytes, more than the"
+			" %#x slot\n", out_w, out_h, AMP_CAM_BPP,
+			(size_t)out_w * out_h * AMP_CAM_BPP,
+			AMP_CAM_SLOT_SIZE);
+		return -1;
+	}
+
+	/* Exactly what the conversion reads: the Y plane, then the interleaved
+	 * chroma plane at half the height.
+	 *
+	 * Resampling is about the CPU path only. When the RGA is rotating it scales
+	 * too, in the same operation, so the index tables would be built and never
+	 * looked at.
+	 */
+
+	bool resample = (c->rot == 0 &&
+			 (c->src_w != out_w || c->src_h != out_h));
 
 	c->nv12len = (size_t)c->src_ystride * c->src_h * 3 / 2;
 
@@ -1675,6 +1746,26 @@ static int cam_publish_setup(struct camera *c, volatile uint8_t *shm,
 
 	memset(c->stage, 0, (size_t)out_w * out_h * AMP_CAM_BPP);
 	memset(c->nv12, 0, c->nv12len);
+
+#ifdef AMP_WITH_RKNN
+
+	/* After the buffers exist, because the setup takes a pointer to one of
+	 * them. Failing here is fatal for the stream rather than a fallback to the
+	 * CPU: the caller asked for a full-screen frame and the CPU cannot produce
+	 * one, so quietly publishing a differently-shaped picture would be worse
+	 * than saying so.
+	 */
+
+	if (c->rot != 0 && cam_rotate_setup(c, out_w, out_h) < 0) {
+		free(c->stage);
+		free(c->nv12);
+		c->stage = NULL;
+		c->nv12 = NULL;
+		return -1;
+	}
+
+#endif
+
 
 	/* The divides happen here, once, instead of per pixel per frame. When the
 	 * ISP gave us exactly what we asked for these are the identity, which is
@@ -2040,13 +2131,51 @@ static void cam_drain(struct camera *c, int rpfd, bool verbose)
 
 		clock_gettime(CLOCK_MONOTONIC, &t0);
 
-		if (c->xmap == NULL)
+		/* Rotation goes through the RGA; everything else stays on the CPU.
+		 *
+		 * Not a preference - the CPU path cannot do this at a sensible
+		 * cost. Its fast case is a linear scan writing contiguous output,
+		 * which is why it vectorises at all: 334 NEON instructions where
+		 * the general resampling path gets none, because that one gathers
+		 * through an index table and the vectoriser gives up. Rotating
+		 * makes every output row a strided gather down a source column, so
+		 * it would land in the same place as the gather path and lose the
+		 * 5.4x that vectorising bought.
+		 *
+		 * The RGA writes into the same staging buffer the CPU path uses,
+		 * so the publish step below is untouched. That matters: the
+		 * carveout is MT_DEVICE_nGnRnE on this side and the one bulk copy
+		 * into it is what makes publishing affordable at all. Pointing the
+		 * RGA at the carveout directly would have been a new and
+		 * unverified thing; pointing it at ordinary cached memory is what
+		 * the detector already does.
+		 */
+
+#ifdef AMP_WITH_RKNN
+		if (c->rot != 0) {
+			if (cam_rotate(c) < 0) {
+				/* Leaving the previous frame in the staging
+				 * buffer would publish it again with a new
+				 * sequence number, which reads as a live camera
+				 * that has frozen. Requeue and skip instead.
+				 */
+
+				if (ioctl(c->fd, VIDIOC_QBUF, &buf) < 0)
+					fprintf(stderr, "%s: QBUF: %s\n",
+						c->name, strerror(errno));
+
+				continue;
+			}
+		} else
+#endif
+		if (c->xmap == NULL) {
 			nv12_to_xrgb_1to1(c->nv12, c->src_h, c->src_ystride,
 					  c->stage, c->out_w, c->out_h);
-		else
+		} else {
 			nv12_to_xrgb(c->nv12, c->src_h, c->src_ystride,
 				     c->stage, c->out_w, c->out_h, c->xmap,
 				     c->ymap);
+		}
 
 		clock_gettime(CLOCK_MONOTONIC, &t1);
 
@@ -2310,6 +2439,16 @@ struct detector {
 
 	uint32_t width;
 	uint32_t height;
+	/* The display path's rotation, not this detector's stream. The model always
+	 * sees the sensor's landscape view; only the published frame is turned.
+	 * Boxes are published in the frame's coordinates, so they have to turn by
+	 * the same angle or they land where the picture is not.
+	 *
+	 * det_start takes this as its own argument rather than reading it off the
+	 * struct camera it is handed, because that one is the second stream, whose
+	 * rot is always zero.
+	 */
+	uint32_t rot;
 	uint32_t published;
 	uint32_t notify_fail;
 
@@ -2542,6 +2681,145 @@ static void det_publish(struct detector *d, const struct amp_det_box *box,
 		}                                                       \
 	} while (0)
 
+/****************************************************************************
+ * Name: rga_load
+ *
+ * Description:
+ *   Resolve librga into a caller-provided table.
+ *
+ *   Shared by the detector, which scales frames for the model, and the display
+ *   path, which rotates them. Each keeps its own table rather than reaching into
+ *   the other's: rotating the picture must work with -C alone, and making it
+ *   depend on the detector having started would be a coupling with no reason
+ *   behind it. dlopen refcounts, so the two are the same mapping.
+ *
+ ****************************************************************************/
+
+static int rga_load(struct rga_fns *r, const char *who)
+{
+	if (r->lib != NULL)
+		return 0;
+
+	r->lib = dlopen("librga.so", RTLD_NOW);
+	if (r->lib == NULL) {
+		fprintf(stderr, "%s: librga.so: %s\n", who, dlerror());
+		return -1;
+	}
+
+	DLSYM(r->lib, r->wrap, "wrapbuffer_virtualaddr_t");
+	DLSYM(r->lib, r->process, "improcess");
+
+	/* Plain dlsym for the import entry points: see struct rga_fns. Missing
+	 * these costs 2.3ms a frame, not the feature.
+	 */
+
+	*(void **)(&r->import_fd) = dlsym(r->lib, "importbuffer_fd");
+	*(void **)(&r->import_va) = dlsym(r->lib, "importbuffer_virtualaddr");
+	*(void **)(&r->wrap_handle) = dlsym(r->lib, "wrapbuffer_handle_t");
+	*(void **)(&r->release_handle) = dlsym(r->lib, "releasebuffer_handle");
+
+	return 0;
+}
+
+/****************************************************************************
+ * Name: cam_rotate_setup
+ *
+ * Description:
+ *   Prepare the display path to rotate, and say what it will produce.
+ *
+ *   The output is the remote's framebuffer size rather than a constant, because
+ *   "full screen" means "whatever the remote is drawing into" - it publishes its
+ *   geometry in the control block for exactly this kind of question, and hard
+ *   coding 540x960 would make a different panel a code change.
+ *
+ ****************************************************************************/
+
+static int cam_rotate_setup(struct camera *c, uint32_t out_w, uint32_t out_h)
+{
+	c->rga = calloc(1, sizeof(struct rga_fns));
+	if (c->rga == NULL) {
+		fprintf(stderr, "%s: out of memory\n", c->name);
+		return -1;
+	}
+
+	if (rga_load(c->rga, c->name) < 0) {
+		free(c->rga);
+		c->rga = NULL;
+		return -1;
+	}
+
+	/* A staged copy of the source, for the same reason the CPU path stages
+	 * one: a V4L2 MMAP buffer is MT_NORMAL_NC, and the earlier measurement
+	 * that mattered here was that reading the capture buffer, not writing the
+	 * output, was where the time went. The RGA reads it by DMA rather than with
+	 * the CPU, so this is less clearly a win than it is for the CPU path - but
+	 * it also lets the buffer go back to the ISP before a 1.5ms conversion
+	 * rather than after it.
+	 */
+
+	c->rotsrc = c->nv12;
+
+	printf("%s: rotating %u degrees, publishing %ux%u to fill the remote's"
+	       " framebuffer\n", c->name, c->rot, out_w, out_h);
+
+	return 0;
+}
+
+/****************************************************************************
+ * Name: cam_rotate
+ *
+ * Description:
+ *   One frame, rotated and scaled into the staging buffer.
+ *
+ ****************************************************************************/
+
+static int cam_rotate(struct camera *c)
+{
+	rga_buffer_t src;
+	rga_buffer_t dst;
+	rga_buffer_t pat;
+	im_rect srect;
+	im_rect drect;
+	im_rect prect;
+	IM_STATUS st;
+	int usage = IM_SYNC;
+
+	memset(&pat, 0, sizeof(pat));
+	memset(&srect, 0, sizeof(srect));
+	memset(&drect, 0, sizeof(drect));
+	memset(&prect, 0, sizeof(prect));
+
+	src = c->rga->wrap(c->rotsrc, (int)c->src_w, (int)c->src_h,
+			   (int)c->src_ystride, (int)c->src_h,
+			   RK_FORMAT_YCbCr_420_SP);
+
+	dst = c->rga->wrap(c->stage, (int)c->out_w, (int)c->out_h,
+			   (int)c->out_w, (int)c->out_h, RK_FORMAT_BGRA_8888);
+
+	if (src.width == 0 || dst.width == 0) {
+		fprintf(stderr, "%s: RGA wrapbuffer failed\n", c->name);
+		return -1;
+	}
+
+	/* The rotation is a usage flag rather than a rectangle, and the
+	 * destination rectangle is the whole output: improcess() takes the
+	 * rotation into account when it maps one to the other, so the width and
+	 * height here are the output's own and not the source's transposed.
+	 */
+
+	usage |= (c->rot == 270) ? IM_HAL_TRANSFORM_ROT_270 :
+		 IM_HAL_TRANSFORM_ROT_90;
+
+	st = c->rga->process(src, dst, pat, srect, drect, prect, usage);
+	if (st != IM_STATUS_SUCCESS) {
+		fprintf(stderr, "%s: RGA rotate failed (%d)\n", c->name,
+			(int)st);
+		return -1;
+	}
+
+	return 0;
+}
+
 static int det_load_libs(struct detector *d)
 {
 	d->rk.lib = dlopen("librknnrt.so", RTLD_NOW);
@@ -2553,11 +2831,8 @@ static int det_load_libs(struct detector *d)
 		return -1;
 	}
 
-	d->rga.lib = dlopen("librga.so", RTLD_NOW);
-	if (d->rga.lib == NULL) {
-		fprintf(stderr, "detector: librga.so: %s\n", dlerror());
+	if (rga_load(&d->rga, "detector") < 0)
 		return -1;
-	}
 
 	DLSYM(d->rk.lib, d->rk.init, "rknn_init");
 	DLSYM(d->rk.lib, d->rk.destroy, "rknn_destroy");
@@ -2567,21 +2842,6 @@ static int det_load_libs(struct detector *d)
 	DLSYM(d->rk.lib, d->rk.outputs_get, "rknn_outputs_get");
 	DLSYM(d->rk.lib, d->rk.outputs_release, "rknn_outputs_release");
 	DLSYM(d->rk.lib, d->rk.set_core_mask, "rknn_set_core_mask");
-
-	DLSYM(d->rga.lib, d->rga.wrap, "wrapbuffer_virtualaddr_t");
-	DLSYM(d->rga.lib, d->rga.process, "improcess");
-
-	/* Plain dlsym, not DLSYM: see struct rga_fns. Missing these is a slower
-	 * conversion, not a missing detector.
-	 */
-
-	*(void **)(&d->rga.import_fd) = dlsym(d->rga.lib, "importbuffer_fd");
-	*(void **)(&d->rga.import_va) = dlsym(d->rga.lib,
-					      "importbuffer_virtualaddr");
-	*(void **)(&d->rga.wrap_handle) = dlsym(d->rga.lib,
-						"wrapbuffer_handle_t");
-	*(void **)(&d->rga.release_handle) = dlsym(d->rga.lib,
-						   "releasebuffer_handle");
 
 	return 0;
 }
@@ -3671,8 +3931,17 @@ static uint32_t yolo_nms(struct detector *d, uint32_t n, float thresh)
 static uint32_t det_emit(struct detector *d, uint32_t n,
 			 struct amp_det_box *box)
 {
-	float kx = (float)d->width / (float)d->lb_w;
-	float ky = (float)d->height / (float)d->lb_h;
+	/* Scale into the frame as the sensor saw it, which is the published frame
+	 * with its sides swapped back when the picture is being turned. Doing it
+	 * this way round keeps one multiply per edge: scaling straight into the
+	 * turned frame would need the two factors crossed over, which is the same
+	 * arithmetic written so that nothing downstream can tell which space a
+	 * number is in.
+	 */
+	uint32_t lw = (d->rot != 0) ? d->height : d->width;
+	uint32_t lh = (d->rot != 0) ? d->width : d->height;
+	float kx = (float)lw / (float)d->lb_w;
+	float ky = (float)lh / (float)d->lb_h;
 	uint32_t out = 0;
 	uint32_t i;
 
@@ -3700,6 +3969,38 @@ static uint32_t det_emit(struct detector *d, uint32_t n,
 		y0 *= ky;
 		x1 *= kx;
 		y1 *= ky;
+		/* Turn the rectangle the same way RGA turned the pixels. Both
+		 * angles are clockwise, which is what HAL_TRANSFORM_ROT_90 and
+		 * ROT_270 mean - see drmrga.h, where the names are documented as
+		 * rotating the source clockwise. Getting this backwards puts every
+		 * box 180 degrees from its subject, which looks like a broken model
+		 * rather than a sign flip, so the direction is taken from the
+		 * header rather than from what looks right on one board.
+		 *
+		 * A clockwise quarter turn sends (x, y) to (lh - y, x): the
+		 * landscape height becomes the published width. Both edges of each
+		 * axis move, and they swap ends, so the rectangle is rebuilt rather
+		 * than adjusted in place.
+		 */
+		if (d->rot == 90) {
+			float rx0 = (float)lh - y1;
+			float ry0 = x0;
+			float rx1 = (float)lh - y0;
+			float ry1 = x1;
+			x0 = rx0;
+			y0 = ry0;
+			x1 = rx1;
+			y1 = ry1;
+		} else if (d->rot == 270) {
+			float rx0 = y0;
+			float ry0 = (float)lw - x1;
+			float rx1 = y1;
+			float ry1 = (float)lw - x0;
+			x0 = rx0;
+			y0 = ry0;
+			x1 = rx1;
+			y1 = ry1;
+		}
 
 		/* Anything that clamped away to nothing is dropped rather than
 		 * published as a zero-sized box. The remote would draw a dot,
@@ -4176,7 +4477,7 @@ static void *det_thread(void *arg)
  ****************************************************************************/
 
 static int det_start(struct detector *d, volatile uint8_t *shm, uint32_t width,
-		     uint32_t height, int rpfd, bool synthetic,
+		     uint32_t height, uint32_t rot, int rpfd, bool synthetic,
 		     struct camera *cam, const char *model, const char *labels,
 		     uint32_t core, uint32_t min_score,
 		 const char *dump, bool zerocopy)
@@ -4184,6 +4485,7 @@ static int det_start(struct detector *d, volatile uint8_t *shm, uint32_t width,
 	d->desc = (volatile struct amp_det_desc *)(shm + AMP_DET_DESC_OFFSET);
 	d->width = width;
 	d->height = height;
+	d->rot = rot;
 	d->rpfd = rpfd;
 	d->synthetic = synthetic;
 	d->stop = false;
@@ -4430,6 +4732,10 @@ static void usage(const char *prog)
 		"  -c pct     publish only boxes at this confidence or above\n"
 		"             (default 35; 0 shows everything the model emits)\n"
 
+		"  -r deg     rotate the picture 90 or 270 degrees so it fills\n"
+		"             the remote's screen instead of sitting in a band\n"
+		"             across the middle. Needs the RGA; the aspect\n"
+		"             ratios match exactly, so nothing is cropped\n"
 		"  -Z         try converting out of imported dma-buf handles\n"
 		"             instead of mapping pages every call. Checked\n"
 		"             against the mapped path over 60 frames first, and\n"
@@ -4475,6 +4781,7 @@ int main(int argc, char **argv)
 	const char *ai_labels = "model/coco_80_labels_list.txt";
 	const char *ai_dump = NULL;
 	bool ai_zerocopy = false;
+	int cam_rot = 0;
 
 	/* Core 0, not auto. Measured: 17.4ms on one core against 10.0ms on all
 	 * three, so three times the hardware buys 1.74x. Pinning costs 30 percent
@@ -4516,7 +4823,7 @@ int main(int argc, char **argv)
 	det.fd = -1;
 
 	while ((opt = getopt(argc, argv,
-			     "d:T:qthCV:W:H:DS:R:aAM:L:N:c:P:Z")) != -1) {
+			     "d:T:qthCV:W:H:DS:R:aAM:L:N:c:P:Zr:")) != -1) {
 		switch (opt) {
 		case 'd':
 			card = optarg;
@@ -4593,6 +4900,28 @@ int main(int argc, char **argv)
 			 */
 
 			ai_zerocopy = true;
+			break;
+		case 'r':
+#ifdef AMP_WITH_RKNN
+			if (strcmp(optarg, "0") == 0) {
+				cam_rot = 0;
+			} else if (strcmp(optarg, "90") == 0) {
+				cam_rot = 90;
+			} else if (strcmp(optarg, "270") == 0) {
+				cam_rot = 270;
+			} else {
+				fprintf(stderr, "-r wants 0, 90 or 270\n");
+				return EXIT_FAILURE;
+			}
+
+			want_camera = true;
+#else
+			(void)cam_rot;
+			fprintf(stderr,
+				"-r needs the RGA, which this build does not"
+				" have - rebuild with -DAMP_WITH_RKNN\n");
+			return EXIT_FAILURE;
+#endif
 			break;
 		case 'c': {
 			/* Range-checked, because a threshold above 100 would
@@ -4845,14 +5174,30 @@ int main(int argc, char **argv)
 	 * dark panel and looked like a touch fault.
 	 */
 
+	/* Rotating changes both ends of the display stream.
+	 *
+	 * The published frame becomes the remote's framebuffer size, since that is
+	 * what "full screen" means, and the ISP is asked for that transposed - so
+	 * the RGA has only to rotate and not also to scale, and no resolution is
+	 * invented or thrown away. The ISP clamps silently, so what it actually
+	 * gives is read back and the RGA scales as well if the two disagree.
+	 */
+
+	if (cam_rot != 0) {
+		cam_w = fb_w;
+		cam_h = fb_h;
+	}
+
 	if (want_camera) {
-		if (cam_open(&cam, "display", "mainpath", cam_dev, cam_w,
-			     cam_h, !quiet) < 0) {
+		if (cam_open(&cam, "display", "mainpath", cam_dev,
+			     cam_rot ? cam_h : cam_w, cam_rot ? cam_w : cam_h,
+			     !quiet) < 0) {
 			fprintf(stderr, "camera will NOT be published\n");
 		} else {
 			struct timespec t;
 
 			cam.publish = true;
+			cam.rot = cam_rot;
 
 			if (cam_publish_setup(&cam, shm, cam_w, cam_h) < 0) {
 				cam_close(&cam);
@@ -4921,7 +5266,8 @@ int main(int argc, char **argv)
 				"-A and -a together: running real inference,"
 				" ignoring -a\n");
 
-		if (det_start(&ai, shm, cam.out_w, cam.out_h, rpfd, !want_ai,
+		if (det_start(&ai, shm, cam.out_w, cam.out_h, (uint32_t)cam.rot,
+			      rpfd, !want_ai,
 			      &det, ai_model, ai_labels, ai_core,
 			      ai_minscore, ai_dump, ai_zerocopy) < 0)
 			fprintf(stderr, "detector will NOT run\n");

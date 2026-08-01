@@ -46,6 +46,7 @@ struct yolo_cand {
 struct detector {
 	uint32_t width;
 	uint32_t height;
+	uint32_t rot;
 	uint32_t lb_pad_x;
 	uint32_t lb_pad_y;
 	uint32_t lb_w;
@@ -228,6 +229,97 @@ int main(void)
 		check("truncates at capacity, keeping the best",
 		      n == AMP_DET_MAXBOX && box[0].score == 99 && ordered &&
 		      box[0].score > box[n - 1].score, msg);
+	}
+
+	/* Rotation. The model always sees the sensor's landscape view, so when the
+	 * published frame is turned the boxes have to turn with it.
+	 *
+	 * The published frame is 540x960 here, so the unrotated frame the factors
+	 * scale into is its transpose, 960x540. The letterbox stays the same
+	 * 640x360-inside-640x640 as above, because the detector's stream is not the
+	 * one being rotated.
+	 */
+
+	setup(0);
+	d.width = 540;
+	d.height = 960;
+	d.rot = 90;
+	put(0, 0.0f, 140.0f, 640.0f, 360.0f, 0.9f, 0);
+	n = det_emit(&d, 1, box);
+	snprintf(msg, sizeof(msg), "%u box: %u,%u %ux%u", n, box[0].x, box[0].y,
+		 box[0].w, box[0].h);
+	check("rot 90: full image fills the turned frame",
+	      n == 1 && box[0].x == 0 && box[0].y == 0 && box[0].w == 540 &&
+	      box[0].h == 960, msg);
+
+	/* The one that pins the direction rather than the shape.
+	 *
+	 * A box in the top-left of what the sensor saw must appear in the
+	 * top-right of a frame turned clockwise. Every check above passes just as
+	 * well with the sign flipped, so without a corner this transform could be
+	 * 180 degrees out and still look tested.
+	 *
+	 * 64x36 of letterbox is 96x54 of landscape, at its origin. Turned
+	 * clockwise that lands against the right edge: x from 540-54 to 540, y
+	 * from 0 to 96.
+	 */
+
+	setup(0);
+	d.width = 540;
+	d.height = 960;
+	d.rot = 90;
+	put(0, 0.0f, 140.0f, 64.0f, 36.0f, 0.9f, 0);
+	n = det_emit(&d, 1, box);
+	snprintf(msg, sizeof(msg), "%u,%u %ux%u (want 486,0 54x96)", box[0].x,
+		 box[0].y, box[0].w, box[0].h);
+	check("rot 90: sensor top-left goes top-right",
+	      n == 1 && box[0].x == 486 && box[0].y == 0 && box[0].w == 54 &&
+	      box[0].h == 96, msg);
+
+	/* The same box at 270, which must land in the opposite corner. Asserting
+	 * both angles is what stops the two branches from being copies of each
+	 * other - a mistake that leaves 270 quietly behaving like 90.
+	 */
+
+	setup(0);
+	d.width = 540;
+	d.height = 960;
+	d.rot = 270;
+	put(0, 0.0f, 140.0f, 64.0f, 36.0f, 0.9f, 0);
+	n = det_emit(&d, 1, box);
+	snprintf(msg, sizeof(msg), "%u,%u %ux%u (want 0,864 54x96)", box[0].x,
+		 box[0].y, box[0].w, box[0].h);
+	check("rot 270: sensor top-left goes bottom-left",
+	      n == 1 && box[0].x == 0 && box[0].y == 864 && box[0].w == 54 &&
+	      box[0].h == 96, msg);
+
+	/* Turning a box must move it and swap its sides without changing its size.
+	 * This is the invariant that catches a scale factor left on the wrong axis
+	 * after the turn, which the corner checks above would still pass if both
+	 * factors happened to be equal.
+	 */
+
+	{
+		struct amp_det_box unrot;
+
+		setup(0);
+		d.width = 960;
+		d.height = 540;
+		put(0, 200.0f, 200.0f, 120.0f, 80.0f, 0.9f, 0);
+		n = det_emit(&d, 1, box);
+		unrot = box[0];
+
+		setup(0);
+		d.width = 540;
+		d.height = 960;
+		d.rot = 90;
+		put(0, 200.0f, 200.0f, 120.0f, 80.0f, 0.9f, 0);
+		n = det_emit(&d, 1, box);
+		snprintf(msg, sizeof(msg), "%ux%u turned to %ux%u", unrot.w,
+			 unrot.h, box[0].w, box[0].h);
+		check("rot 90: turning swaps the sides, keeps the size",
+		      n == 1 && box[0].w == unrot.h && box[0].h == unrot.w,
+		      msg);
 	}
 
 	printf("%s\n", fails == 0 ? "emit and transform correct" :

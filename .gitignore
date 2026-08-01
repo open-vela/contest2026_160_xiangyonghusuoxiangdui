@@ -14,6 +14,7 @@ amp_shm_scan
 amp_fb_show
 amp_npu_probe
 amp_rga_probe
+amp_isp_range
 
 # Board-side NPU bundle: vendor runtime, a prebuilt model and the vendor demos,
 # all copied out of rknn-toolkit2 rather than authored here. About 23MB, and

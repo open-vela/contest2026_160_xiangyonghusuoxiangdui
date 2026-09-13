@@ -1,0 +1,34 @@
+{
+  "schemaVersion": "1.0.0",
+  "dataModelVersion": 1,
+  "id": "sess_1660179d-04f8-44a2-bd2e-b7a1710d3abf",
+  "title": "/media/1t/openvela/armbain/.kiro  这个路径下有之前的对话日志吗？",
+  "agentMode": "vibe",
+  "workspacePaths": [
+    "/media/1t/openvela/armbain"
+  ],
+  "rootPaths": [
+    "/media/1t/openvela/armbain"
+  ],
+  "createdAt": "2026-09-13T07:35:04.297Z",
+  "lastModifiedAt": "2026-09-13T07:38:07.326Z",
+  "modelId": "claude-opus-4.8",
+  "autopilot": false,
+  "effortLevel": "high",
+  "semanticReviewEnabled": true,
+  "ftaEnabled": false,
+  "workflowsEnabled": false,
+  "specPlanEnabled": false,
+  "specWorkflow": "quick",
+  "specSkipClarificationEnabled": true,
+  "status": "in_progress",
+  "_meta": {
+    "kiro": {
+      "policyPreset": [
+        "edit-workspace"
+      ],
+      "shellType": "bash",
+      "language": "Chinese (China)"
+    }
+  }
+}

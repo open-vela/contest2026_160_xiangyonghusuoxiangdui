@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "1.0.0",
+  "dataModelVersion": 1,
+  "id": "sess_290cab66-ea31-42b4-9dfa-d85a05a11d0a",
+  "title": ".kiro/board-changes/rk3588-evb7-v11.md 当前记录的skill还在吗",
+  "agentMode": "vibe",
+  "workspacePaths": [
+    "/media/1t/openvela/armbain"
+  ],
+  "createdAt": "2026-07-14T02:04:39.108Z",
+  "lastModifiedAt": "2026-09-07T12:59:10.654Z",
+  "modelId": "claude-opus-5",
+  "autopilot": true,
+  "effortLevel": "high",
+  "semanticReviewEnabled": true,
+  "ftaEnabled": false,
+  "specPlanEnabled": false,
+  "specWorkflow": "quick",
+  "specSkipClarificationEnabled": true,
+  "status": "idle"
+}

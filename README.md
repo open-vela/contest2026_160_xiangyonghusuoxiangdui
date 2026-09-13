@@ -71,10 +71,23 @@ LVGL 界面 + 触摸交互 + 开机自启，是可演示的产品形态，不只
 ```text
 contest2026_160_xiangyonghusuoxiangdui/
 ├── README.md                          本文件
-├── amp1.c / amp_start.S / amp.ld      最早的 A55 裸机验证固件（AMP 拉核链路的第一块试金石）
-├── build.sh                           编译上面那个裸机固件
-├── amp.its                            FIT 描述：把固件打进 amp.img
-├── parameter-amp.txt                  分区表：在官方分区表上加 16MB `amp` 分区
+├── rk3588-amp-demo/                   ★ AMP 载荷 + Linux 用户态 + 主机侧回归（本作品运行的核心目录）
+│   ├── amp1.c / amp_start.S / amp.ld  最早的 A55 裸机验证固件（AMP 拉核链路的第一块试金石）
+│   ├── build.sh                       编译上面那个裸机固件
+│   ├── amp.its / amp-nuttx.its / amp-m0.its / amp-m0-nuttx.its
+│   │                                  FIT 描述，逐步演进：裸机 → 单 NuttX → cpu_l3+M0 双固件
+│   ├── amp.img                        打包产物：一个 FIT 同时装 cpu_l3 与 M0 两个固件
+│   ├── parameter-amp.txt              分区表：在官方分区表上加 16MB `amp` 分区
+│   ├── amp_fb_show.c                  ★ Linux 侧主程序：V4L2 采集 + RGA + RKNN 推理 + 旋转 + 发布
+│   ├── amp_isp_range.c / amp_npu_probe.c / amp_rga_probe.c
+│   │                                  上板探针小程序（ISP 范围 / NPU / RGA 能力验证）
+│   ├── amp_shm_test.c / amp_shm_scan.c   共享内存契约的读写与扫描验证
+│   ├── nuttx.bin                      cpu_l3 NuttX 固件产物
+│   ├── m0/                            M0 侧裸机与固件（m0_start.S / m0.ld / build-m0.sh / nuttx-m0.bin）
+│   ├── deploy/                        板上部署：4 个 systemd unit + install.sh / selftest.sh + wifi 配置
+│   ├── npu-a17/                       RKNN 运行时（librknnrt.so / librga.so / yolov5s 模型 / 标签）
+│   ├── tests/                         主机侧回归：yolo 解码对比 + emit + 触摸解码
+│   └── _a55_backup/                   各里程碑 amp.img 备份（回退用，对应关系见 SETUP）
 ├── app/hello_app/                     应用形态占位（本作品的 NuttX 应用见 §3.2）
 ├── board/contest_board/               板级形态占位（本作品的板级代码见 §3.2）
 ├── quickapp/hello_quickapp/           快应用占位（本作品未使用）

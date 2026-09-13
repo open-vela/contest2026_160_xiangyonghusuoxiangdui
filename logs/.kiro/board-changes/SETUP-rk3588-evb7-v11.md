@@ -139,6 +139,63 @@ rkdeveloptool ld        # 应看到 DevNo=1 ... Maskrom
 
 ---
 
+## 3.1 改动仓库汇总（GitHub 链接待补充）
+
+下表列出本项目**发生过代码改动**的全部仓库。`GitHub 链接`一列留空，请自行填入各仓库对应的
+远端地址（fork/上游均可）。
+
+| 仓库 | 本地路径 | 分支 | 改动内容概述 | GitHub 链接 |
+|------|---------|------|-------------|------------|
+| kernel（Rockchip BSP 6.1.141） | `/media/1t/openvela/kernel` | develop-6.1 | AMP dts（`rk3588-evb7-v11-linux-amp.dts`：cpu_l3 摘核、amp/rpmsg 保留区、reserved-plane、关 vop_mmu）；kernel fragment `rk3588_g610.config` / `rk3588_wifibt.config`；新驱动 `drivers/tty/rpmsg_nsh_tty.c`；`rpmsg_char`/`rpmsg_ctrl`/`rockchip_rpmsg_test` 配置 | https://github.com/C-Ackerman/kernel/tree/rk3588-evb7-v11 |
+| u-boot（vendor 2017.09） | `/media/1t/openvela/u-boot` | next-dev | `configs/rk3588_defconfig` 追加 `CONFIG_AMP=y` + `CONFIG_ROCKCHIP_AMP=y` | https://github.com/C-Ackerman/u-boot/tree/rk3588-evb7-v11 |
+| work/nuttx（openvela NuttX） | `/media/1t/openvela/work/nuttx` | 0712 | 新增 arm64 chip 层 `arch/arm64/src/rk3588/`（GICv3 rdist 修复、EL1 物理 timer、rptun、rsctable、共享内存非缓存）+ board `boards/arm64/rk3588/evb7-amp/`（fb/touch/shm/vop/cam）；新增 armv6-m chip 层 `arch/arm/src/rk3588-m0/` + board `boards/arm/rk3588-m0/evb7-m0/`；通用驱动 `drivers/serial/uart_rpmsg.c` re-announce 改动 | https://github.com/C-Ackerman/nuttx-openvela/tree/rk3588-evb7-v11 |
+| work/apps（openvela apps） | `/media/1t/openvela/work/apps` | 0801 | 新增 `examples/ampcam`（相机帧读取+画框）、`examples/ampui`（LVGL 主页+相机页） | https://github.com/C-Ackerman/nuttx-apps-openvela/tree/rk3588-evb7-v11 |
+| rk3588-amp-demo（AMP 载荷 + Linux 用户态） | `/media/1t/openvela/rk3588-amp-demo` | master | amp.img 打包（`amp-m0-nuttx.its` / `parameter-amp.txt`）；Linux 侧 `amp_fb_show.c`（采集/NPU/显示/触摸转发）；M0 裸机固件 `m0/`；诊断工具 `amp_shm_*.c` / `amp_rga_probe.c` / `amp_isp_range.c` / `amp_npu_probe.c`；部署 `deploy/`（systemd unit + install.sh）；`tests/` | https://github.com/open-vela/contest2026_160_xiangyonghusuoxiangdui |
+
+> ⚠️ **rkbin**（`/media/1t/openvela/rkbin`）曾在一轮尝试中改过 `RKTRUST/RK3588TRUST.ini`
+> 指向 patched OP-TEE，但因 vendor BL31 与主线 OP-TEE 不兼容**已完全还原**，本质无改动，
+> 故未列入上表。其内容（DDR v1.21 / BL31 v1.54 blob）保持官方原样。
+
+---
+
+## 3.2 官方固件用了哪些（官方 vs 自建对照）
+
+本项目是**官方 BSP 基线 + 自建组件替换**的混合。下表把散落在 §1 / §5 / §6.1 的信息汇总成一处。
+
+**官方固件下载地址**：https://redmine.rock-chips.com/urllist （Rockchip Redmine 固件列表 Linux6.12 debain）
+https://meta.box.lenovo.com/v/link/view/a6912849a31742ecb7474509135a3f6b
+
+固件包本地目录（下称 `$ROCKDEV`）：
+`/media/1t/openvela/rk3588_EVB7/RK3588-EVB7-V11-DEBIAN_V1.0.0_20260620/RK3588-EVB7-V11-LINUX/rockdev/`
+
+### 保留使用的官方组件
+
+| 分区 / 组件 | 官方文件 | 说明 |
+|------|---------|------|
+| **rootfs** | `$ROCKDEV/rootfs.img`（约 6.5GB） | 官方 Debian，含 GNOME / weston / **libmali-valhall-g610**（GPU）/ **bcmdhd 固件 + nvram**（WiFi）/ **BCM4359C0.hcd**（蓝牙）。整个用户态都来自它 |
+| **oem** | `$ROCKDEV/oem.img` | 原样刷入 |
+| **userdata** | `$ROCKDEV/userdata.img` | 重新分区后**必须重刷官方这份**，否则 systemd 掉进 emergency mode（见 §5 ⚠️） |
+| **trust blobs** | rkbin：DDR v1.21 / **BL31 v1.54** / BL32(OP-TEE) v1.20 | AMP 拉核依赖 BL31 的 vendor SIP；打进自建 uboot.img，blob 本身保持官方（见 §6.1） |
+
+### 被自建组件替换的（不再用官方）
+
+| 分区 / 组件 | 官方文件 | 替换成 |
+|------|---------|--------|
+| loader / SPL | `MiniLoaderAll.bin` | 自编 vendor u-boot 产出的 `rk3588_spl_loader_v1.21.114.bin`（§6.1） |
+| **uboot** | `uboot.img` | 自编 AMP 版（`CONFIG_AMP` + vendor BL31 + OP-TEE 打成 FIT，§6.1） |
+| **boot** | `boot.img` | 自编（AMP dts + G610/wifibt fragment 内核 + resource，§6.2） |
+| 分区表 | `parameter.txt` | `parameter-amp.txt`（新增 16MB `amp` 分区，§5） |
+| **kernel** | boot.img 内的官方内核 | 官方 BSP **源码** 6.1.141 自行重编（加 AMP dts + 三个 config fragment，§6.2） |
+| **amp**（新分区） | 官方无此分区 | 自建 AMP 载荷 `amp.img`（cpu_l3 NuttX + M0 NuttX，§7） |
+
+> 一句话：**官方贡献 = rootfs（整个用户态）+ oem + userdata + rkbin 的 DDR/BL31/BL32 三个 blob**；
+> u-boot、内核、分区表、AMP 载荷全部自建。
+>
+> ⚠️ **首次刷机会先刷一遍全套官方固件**（§4），那一步只是为了确认板子是好的、拿到"已知好"
+> 的回退基线，**不是最终形态**。最终形态按 §5 的命令混合刷入。
+
+---
+
 ## 4. 第一步：刷官方固件，确认板子是好的
 
 **不要跳过这一步。** 后面所有改动都是在这个基线上做增量，而且很多失败（花屏、起不来）

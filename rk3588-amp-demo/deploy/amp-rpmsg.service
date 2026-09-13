@@ -1,0 +1,27 @@
+[Unit]
+Description=Load AMP rpmsg client modules (rpmsg_char, rpmsg_nsh_tty)
+# The modules live on /userdata rather than on the rootfs, so the mount has to
+# exist before this runs. bcmdhd.service next to this one insmods out of
+# /lib/modules and needs no such declaration; state the dependency rather than
+# relying on local-fs.target happening to be enough.
+RequiresMountsFor=/userdata
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Order between the two does not matter: modinfo reports an empty depends: for
+# both, and neither exports symbols the other needs. They are rpmsg *client*
+# drivers, so loading them before the remote has announced anything is harmless -
+# each binds when its channel appears, and binds to channels already announced
+# when it registers.
+#
+#   rpmsg_char      -> /dev/rpmsg0, which amp_fb_show needs to forward touch
+#   rpmsg_nsh_tty   -> the NuttX nsh console over rpmsg
+ExecStart=/sbin/insmod /userdata/rpmsg_char.ko
+ExecStart=/sbin/insmod /userdata/rpmsg_nsh_tty.ko
+ExecStop=-/sbin/rmmod rpmsg_nsh_tty
+ExecStop=-/sbin/rmmod rpmsg_char
+
+[Install]
+WantedBy=multi-user.target

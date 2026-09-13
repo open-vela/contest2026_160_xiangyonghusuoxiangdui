@@ -1,0 +1,29 @@
+# build artifacts
+*.o
+*.elf
+*.bin
+amp.img
+*.ko
+
+# local firmware backups (known-good images kept out of git)
+_a55_backup/
+
+# host-side test tools (built from the .c next to them)
+amp_shm_test
+amp_shm_scan
+amp_fb_show
+amp_npu_probe
+amp_rga_probe
+amp_isp_range
+
+# Board-side NPU bundle: vendor runtime, a prebuilt model and the vendor demos,
+# all copied out of rknn-toolkit2 rather than authored here. About 23MB, and
+# reconstructible - see the "npu-a17" section of
+# armbian/.kiro/board-changes/rk3588-evb7-v11.md for what goes in it and the
+# toolchain that builds the C++ parts.
+npu-a17/
+# Everything tests/run.sh generates: the functions it extracts from the real
+# sources with awk, and the binaries built from them. Derived, and deliberately
+# so - a committed copy of an extracted function is a copy that goes stale
+# silently, which is the failure mode the extraction exists to avoid.
+tests/build/

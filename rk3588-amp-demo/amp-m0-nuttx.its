@@ -1,0 +1,82 @@
+/*
+ * RK3588 EVB7 V11 AMP FIT (amp.img):
+ *   amp1 - NuttX on cpu_l3 (A55, AArch64), unchanged, brought up via PSCI
+ *   mcu  - NuttX on the PMU Cortex-M0 (ARMv6-M), brought up as a FIT
+ *          "standalone" image
+ *
+ * Same layout as amp-m0.its, but the M0 payload is the NuttX build
+ * (evb7-m0:nsh) instead of the minimal bare-metal heartbeat.
+ *
+ * Build (run from this dir so the data paths resolve):
+ *   cp <nuttx>/nuttx.bin m0/nuttx-m0.bin        # built with evb7-m0:nsh
+ *   <u-boot>/tools/mkimage -f amp-m0-nuttx.its -E -p 0xe00 amp.img
+ *
+ * The uc_start/uc_end properties are required, not optional: u-boot's
+ * standalone_handler() only calls fit_standalone_ext_release() - the function
+ * RK3588 actually implements - when one of sram/exsram/experi/uc_* is present.
+ * Without them it silently falls into the __weak fit_standalone_release() stub,
+ * prints "...OK", and never programs CODE_START nor releases the M0 reset.
+ */
+/dts-v1/;
+/ {
+	description = "RK3588 EVB7 V11 AMP FIT: A55 NuttX + M0 NuttX";
+	#address-cells = <1>;
+
+	images {
+		amp1 {
+			description = "nuttx-cpu3";
+			data        = /incbin/("./nuttx.bin");
+			type        = "firmware";
+			compression = "none";
+			arch        = "arm64";
+			cpu         = <0x300>;      /* cpu_l3 MPIDR */
+			thumb       = <0>;
+			hyp         = <0>;          /* EL1 */
+			load        = <0x30000000>; /* dedicated AMP core region */
+			udelay      = <1000000>;
+			hash { algo = "sha256"; };
+		};
+
+		mcu {
+			description = "nuttx-pmu-m0";
+			data        = /incbin/("./m0/nuttx-m0.bin");
+			type        = "standalone"; /* -> fit_standalone_ext_release */
+			compression = "none";
+			arch        = "arm";        /* Cortex-M0 / ARMv6-M */
+			thumb       = <1>;
+			load        = <0x07a00000>; /* mcu_reserved base (CODE_START) */
+			uc_start    = <0x07a00000>; /* mark the carveout uncached ... */
+			uc_end      = <0x07c00000>; /* ... and select the _ext_ path  */
+
+			/* Off-chip DDR window (soc_con11). The M0 reaches this base at
+			 * 0x60000000; note that the 0x80000000 alias of the same region
+			 * is skewed by +0x20000000 because TRM Table 9-3 subtracts
+			 * 0x60000000 on both rows. Aimed at an unused part of
+			 * mcu_reserved for now, so the window can be proven without
+			 * carving out new memory - and therefore without touching the
+			 * Linux device tree. This is where rpmsg vrings will live; the
+			 * uc_start/uc_end range above already makes it uncached.
+			 */
+			exsram_start = <0x07b00000>;
+			hash { algo = "sha256"; };
+		};
+	};
+
+	configurations {
+		default = "conf";
+		conf {
+			description = "RK3588 AMP: A55 NuttX + M0 NuttX";
+			rollback-index = <0x0>;
+			loadables = "amp1", "mcu";
+			/* Linux stays on cpu0; entry/addrs come from U-Boot */
+			linux {
+				description = "linux-os";
+				arch   = "arm64";
+				cpu    = <0x000>;
+				thumb  = <0>;
+				hyp    = <0>;
+				udelay = <1000000>;
+			};
+		};
+	};
+};

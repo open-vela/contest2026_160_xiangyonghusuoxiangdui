@@ -1,0 +1,71 @@
+[Unit]
+Description=AMP camera publisher: ISP capture, NPU detection, rotated full-screen frames to the AMP core
+
+# The binary, the model and the vendor runtime all live on /userdata, so the
+# mount has to be there first. This is stated rather than inferred from
+# local-fs.target because the failure without it is not a clean one: the program
+# would exit "model not found" and take its restart budget doing it.
+RequiresMountsFor=/userdata
+
+# The ISP nodes are found by scanning /dev/video*, so this has to run after the
+# camera stack is up. Wants rather than Requires: rkaiq_3A is the 3A engine, and
+# a picture with wrong exposure is still a picture worth showing.
+After=rkaiq_3A.service
+Wants=rkaiq_3A.service
+
+# Touch is forwarded over /dev/rpmsg0, which amp-rpmsg.service creates by loading
+# rpmsg_char. Ordered after it, but not required: without it the program prints
+# "touch will NOT be forwarded" and everything else works, so a missing module
+# should not cost the camera.
+After=amp-rpmsg.service
+Wants=amp-rpmsg.service
+
+# No card, no point starting. This turns "exited immediately five times and gave
+# up" into "skipped, condition failed", which says which of the two happened.
+ConditionPathExists=/dev/dri/card0
+
+[Service]
+Type=simple
+
+# The model and the label list are given to the program as relative paths, so
+# this is not cosmetic - it is where those two files are resolved from.
+WorkingDirectory=/userdata/npu-a17
+
+# librknnrt.so and librga.so are opened with dlopen at runtime, not linked, so
+# they are found through this and not through the ELF's own NEEDED list.
+Environment=LD_LIBRARY_PATH=/userdata/npu-a17
+
+# -C  capture and publish frames
+# -r 90  turn the picture so it fills the remote's 540x960 panel instead of
+#        sitting in a 512x288 band across the middle
+# -A -M  run real inference on the second ISP stream
+# -Z  convert out of imported dma-buf handles, checked against the mapped path
+#     over 60 frames first and abandoned if they disagree by a byte
+#
+# The confidence threshold is left at its default of 35. Passing -c 0 here would
+# publish every box the model emits, which is useful when debugging the transport
+# and noise the rest of the time.
+ExecStart=/userdata/amp_fb_show -C -r 90 -A -M yolov5s-640-640.rknn -Z
+
+# Restarted, because the one failure that actually happens is losing the race
+# against whatever else opens the DRM device, and five seconds later it is free.
+#
+# Deliberately not Restart=always with no limit. If the program cannot start at
+# all - no ISP, no model, DRM held by a desktop - systemd's default start limit
+# stops it after a few attempts and marks the unit failed, which is a state
+# `systemctl status` can explain. An unbounded loop would keep the panel
+# flickering and say nothing.
+Restart=on-failure
+RestartSec=5
+
+# Output to the journal rather than to /tmp/cam.log. Same content, but bounded
+# and rotated instead of growing in a tmpfs, and it survives the restarts above
+# instead of being truncated by each one:
+#
+#   journalctl -u amp-camera -f
+#
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

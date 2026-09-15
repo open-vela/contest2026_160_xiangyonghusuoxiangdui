@@ -1,0 +1,89 @@
+
+:openvela$ adb shell
+root@debian:/# ls /dev/tty
+tty      tty14    tty20    tty27    tty33    tty4     tty46    tty52    tty59    tty8     
+tty0     tty15    tty21    tty28    tty34    tty40    tty47    tty53    tty6     tty9     
+tty1     tty16    tty22    tty29    tty35    tty41    tty48    tty54    tty60    ttyFIQ0  
+tty10    tty17    tty23    tty3     tty36    tty42    tty49    tty55    tty61    ttyNSH0  
+tty11    tty18    tty24    tty30    tty37    tty43    tty5     tty56    tty62    ttyNSH1  
+tty12    tty19    tty25    tty31    tty38    tty44    tty50    tty57    tty63    ttyS9    
+tty13    tty2     tty26    tty32    tty39    tty45    tty51    tty58    tty7     
+root@debian:/# ls /dev/tty
+/dev/tty
+root@debian:/#
+root@debian:/# 
+root@debian:/# picocom --imap lfcrlf --omap crlf /dev/ttyNSH0
+picocom v3.1
+
+port is        : /dev/ttyNSH0
+flowcontrol    : none
+baudrate is    : 9600
+parity is      : none
+databits are   : 8
+stopbits are   : 1
+escape is      : C-a
+local echo is  : no
+noinit is      : no
+noreset is     : no
+hangup is      : no
+nolock is      : no
+send_cmd is    : sz -vv
+receive_cmd is : rz -vv -E
+imap is        : lfcrlf,
+omap is        : crlf,
+emap is        : crcrlf,delbs,
+logfile is     : none
+initstring     : none
+exit_after is  : not set
+exit is        : no
+
+!! Settings mismatch !! Type [C-a] [C-v] to see actual port settings
+Type [C-a] [C-h] to see available commands
+Terminal ready
+NuttShell (NSH)
+nsh> 
+nsh> 
+nsh> ps
+  PID GROUP PRI POLICY   TYPE    NPX STATE    EVENT     SIGMASK            STACK COMMAND
+    0     0   0 FIFO     Kthread   - Ready              0000000000000000 0008144 CPU0 IDLE
+    1     0 224 RR       Kthread   - Waiting  Semaphore 0000000000000000 0008080 hpwork 0x300dd640 0x300dd6c0
+    2     2 100 RR       Task      - Running            0000000000000000 0008112 nsh_main
+    4     0 224 RR       Kthread   - Waiting  Semaphore 0000000000000000 0003968 rpmsg-linux-0 0x30114460 0x301144e0
+    5     0 224 RR       Kthread   - Waiting  Semaphore 0000000000000000 0065456 rptun_rx
+    7     7 100 RR       Task      - Waiting  Signal    0000000000000000 0016304 ampui
+nsh>
+nsh> uname -a
+NuttX 0.0.0 46d62592b29-dirty Aug  1 2026 19:26:28 arm64 evb7-amp
+nsh> 
+nsh> 
+nsh> 
+nsh> 
+nsh> 
+nsh> 
+Terminating...
+Thanks for using picocom
+root@debian:/# 
+root@debian:/#ps
+    PID TTY          TIME CMD
+   2647 pts/0    00:00:00 bash
+   2672 pts/0    00:00:00 ps
+root@debian:/# uname -a
+Linux debian 6.1.141 #7 SMP Wed Jul 29 19:48:48 CST 2026 aarch64 GNU/Linux
+root@debian:/# nproc 
+7
+root@debian:/# grep -c ^processor /proc/cpuinfo
+7
+root@debian:/# grep -c ^processor /proc/cpuinfo
+7
+root@debian:/#s /sys/bus/rpmsg/devices/ 
+bash: s: 未找到命令
+root@debian:/# ls /sys/bus/rpmsg/devices/ 
+virtio0.rpmsg_ctrl.0.0	   virtio0.rpmsg-ttyproxy.-1.1024  virtio1.rpmsg-ttym0.-1.1024
+virtio0.rpmsg_ns.53.53	   virtio1.rpmsg_ctrl.0.0
+virtio0.rpmsg-raw.-1.1025  virtio1.rpmsg_ns.53.53
+root@debian:/# mesg | grep -iE 'rockchip-amp|AMP Board'
+bash: mesg: 未找到命令
+root@debian:/# dmesg | grep -iE 'rockchip-amp|AMP Board'
+[    1.912469] Machine model: Rockchip RK3588 EVB7 V11 AMP Board
+[    3.270121] rockchip-pinctrl pinctrl: pin gpio4-29 already requested by rockchip-amp; cannot claim for fe2c0000.mmc
+root@debian:/#

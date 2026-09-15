@@ -1,0 +1,779 @@
+diff --git a/arch/arm64/boot/dts/rockchip/Makefile b/arch/arm64/boot/dts/rockchip/Makefile
+index bc5f135d2..3dded2bc4 100644
+--- a/arch/arm64/boot/dts/rockchip/Makefile
++++ b/arch/arm64/boot/dts/rockchip/Makefile
+@@ -340,6 +340,7 @@ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-evb7-lp4-v10-rk1608-ipc-8x-linux.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-evb7-lp4-v11-linux-ipc.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-evb7-v11.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-evb7-v11-linux.dtb
++dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-evb7-v11-linux-amp.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-evb7-v11-rk628-hdmi2csi.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-evb10-v10.dtb
+ dtb-$(CONFIG_ARCH_ROCKCHIP) += rk3588-evb10-v10-linux.dtb
+diff --git a/arch/arm64/boot/dts/rockchip/rk3588-evb7-v11-linux-amp.dts b/arch/arm64/boot/dts/rockchip/rk3588-evb7-v11-linux-amp.dts
+new file mode 100644
+index 000000000..1cf9f9b16
+--- /dev/null
++++ b/arch/arm64/boot/dts/rockchip/rk3588-evb7-v11-linux-amp.dts
+@@ -0,0 +1,242 @@
++// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
++/*
++ * RK3588 EVB7 V11 - AMP variant
++ * Linux runs on 7 cores; cpu_l3 (MPIDR 0x300) is handed to an AMP firmware.
++ * Ported from rk3588-evb1-lp4-v10-linux-amp.dts (AMP deltas only).
++ */
++
++/dts-v1/;
++
++#include "rk3588-evb7-v11.dtsi"
++#include "rk3588-evb7-v11-imx415.dtsi"
++#include "rk3588-linux.dtsi"
++#include "rk3588-amp.dtsi"
++
++/ {
++model = "Rockchip RK3588 EVB7 V11 AMP Board";
++compatible = "rockchip,rk3588-evb7-v11", "rockchip,rk3588";
++
++cpus {
++cpu-map {
++cluster0 {
++/delete-node/ core3;
++};
++};
++};
++
++reserved-memory {
++#address-cells = <2>;
++#size-cells = <2>;
++ranges;
++
++/* Dedicated AMP core region: high, no-map, clear of kernel/M0/OP-TEE/CMA */
++amp_core: amp-core@30000000 {
++reg = <0x0 0x30000000 0x0 0x01000000>;
++no-map;
++};
++
++/*
++ * rpmsg/shared-mem for remote core; relocated off 0x8200000 (overlapped OP-TEE).
++ *
++ * 8MB, grown from 4MB so that a camera frame filling the 1080x1920 panel fits.
++ * The remote's framebuffer is 540x960 and the VOP scales it, so a full-screen
++ * frame is 540*960*4 = 2073600 bytes; two of those plus the descriptor pages do
++ * not fit in 4MB. The frame used to be 512x288 centred with a black border,
++ * covering 28 percent of the screen, because that was what a 1MB slot held.
++ *
++ * The remote maps this region from a constant in its own build and never reads
++ * this node, so the two sizes have to be changed together: firmware expecting 8MB
++ * against a 4MB reservation would map four megabytes Linux believes it owns.
++ * AMP_SHM_SIZE in boards/arm64/rk3588/evb7-amp/src/evb7_amp_shm.h is the other
++ * half of this pair.
++ *
++ * Room to grow was checked rather than assumed: amp-core above ends exactly at
++ * 0x31000000 and nothing else in this tree is placed below 0x31800000.
++ */
++amp_shmem: amp-shmem@31000000 {
++reg = <0x0 0x31000000 0x0 0x00800000>;
++no-map;
++};
++
++/*
++ * rpmsg link towards the PMU Cortex-M0, carved out of the second half of
++ * mcu@7a00000 (shrunk to 1MB below) so no new memory has to be reserved.
++ * The M0 reaches these same bytes through its off-chip DDR window, which
++ * the AMP FIT aims at 0x07b00000 via exsram_start.
++ *
++ * Sizes follow include/linux/rpmsg/rockchip_rpmsg.h: the driver places
++ * vring0 at the start of this region and vring1 one RPMSG_VRING_SIZE
++ * (0x8000) later, so RPMSG_VRING_OVERHEAD = 0x10000 is the minimum.
++ */
++m0_rpmsg_reserved: m0-rpmsg@7b00000 {
++reg = <0x0 0x07b00000 0x0 0x00010000>;
++no-map;
++};
++
++m0_rpmsg_dma_reserved: m0-rpmsg-dma@7b10000 {
++compatible = "shared-dma-pool";
++reg = <0x0 0x07b10000 0x0 0x00040000>;
++no-map;
++};
++};
++
++/*
++ * Second rpmsg instance, for the M0. rockchip_rpmsg_mbox is a plain platform
++ * driver whose vring addresses come from each node's own reg, so a second
++ * node probes as an independent link.
++ *
++ * It shares mailbox0 with the cpu_l3 link but uses the two free channels:
++ * cpu_l3 holds ch0 (its rx) and ch3 (its tx), so this link takes ch1 and ch2.
++ *
++ * mailbox1 was tried first and does not work: its registers are inaccessible,
++ * and rockchip_mbox_startup() died with a synchronous external abort during
++ * probe, which killed kernel_init and with it the whole boot. Its probe-time
++ * "version: 0x0100" message is not evidence to the contrary - for the 1.0.0
++ * controller that is a driver constant, so probe never reads a register.
++ *
++ * The link-id packs a 4-bit master cpu id and a 4-bit remote id; the RK3576 AMP
++ * dtsi documents the MCU as remote 4, so 0x04.
++ */
++rpmsg_m0: rpmsg@7b00000 {
++compatible = "rockchip,rpmsg";
++mbox-names = "rpmsg-rx", "rpmsg-tx";
++mboxes = <&mailbox0 1 &mailbox0 2>;
++rockchip,vdev-nums = <1>;
++rockchip,link-id = <0x04>;
++reg = <0x0 0x07b00000 0x0 0x00010000>;
++memory-region = <&m0_rpmsg_dma_reserved>;
++status = "okay";
++};
++};
++
++/* Shrink the M0 carveout to 1MB: the upper half now holds the rpmsg vrings and
++ * buffer pool declared above, and the M0 firmware caps its heap accordingly
++ * (CONFIG_RAM_SIZE = 1MB) so it cannot grow into them.
++ */
++&mcu_reserved {
++reg = <0x0 0x07a00000 0x0 0x00100000>;
++};
++
++/* mailbox1 deliberately left disabled: its registers are inaccessible on this
++ * SoC and touching them aborts. Both rpmsg links run on mailbox0, which the
++ * shared dtsi already enables.
++ */
++
++&arm_pmu {
++interrupt-affinity = <&cpu_l0>, <&cpu_l1>, <&cpu_l2>,
++<&cpu_b0>, <&cpu_b1>, <&cpu_b2>, <&cpu_b3>;
++};
++
++/*
++ * Hand vp3's Esmart3 window to the AMP core.
++ *
++ * vp3 drives the MIPI-DSI panel and Linux keeps doing so: it owns the mode, the
++ * clocks, the DSI PHY and the panel. What it gives up is one overlay window,
++ * which the AMP core then points at its own framebuffer. The alternative -
++ * taking the whole video port - would mean reimplementing all of that
++ * initialisation on a core that has no display driver at all.
++ *
++ * Three properties, each doing something different:
++ *
++ * plane-mask has to be spelled out for every video port, not just vp3.
++ * vop2_plane_mask_check() (rockchip_drm_vop2.c:16295) requires the union of all
++ * four masks to equal the SoC's full window set - 0x3cf here - and on any
++ * mismatch it prints "use default plane mask" and calls vop2_plane_mask_assign(),
++ * which throws away primary-plane too. Leaving vp0..vp2 unset (mask 0) or
++ * dropping Esmart3 from vp3 both fail that check, so the assignment below simply
++ * restates the driver's own default distribution. Only primary-plane and
++ * reserved-plane actually differ from stock.
++ *
++ * Keeping Esmart3 in the mask is not just a way to satisfy that check - almost
++ * everything the other core needs falls out of it, because the driver derives
++ * those things from win_mask rather than from how many windows Linux is
++ * actually using:
++ *
++ *   - vop2_layer_map_initial() (rockchip_drm_vop2.c:4585) walks win_mask at
++ *     probe and assigns hardware layers in order. vp0..vp2 take two windows
++ *     each, so vp3 gets layers 6 and 7, and Esmart3 - the higher phys_id - lands
++ *     on 7, the topmost. The same loop sets win_vp_id[Esmart3] = 3.
++ *   - vop2_calc_bg_ovl_and_port_mux() (:12398) sizes each port's slice of the
++ *     mixer chain from hweight32(win_mask), and the last video port is hardcoded
++ *     to take everything remaining (:12437). So layer 7 is in vp3's blend chain.
++ *   - vop2_setup_alpha()'s tail loop (:11985) runs to hweight32(win_mask) and
++ *     configures the mixer for layer 7 even though Linux has no plane there. For
++ *     a source with no alpha channel the values it writes are the same ones it
++ *     would write for a real XRGB8888 plane: an opaque overwrite.
++ *
++ * primary-plane moves to Cluster3 because Esmart3 was it, and a CRTC without a
++ * primary plane cannot be given a framebuffer, which means no modeset and no
++ * timing on the panel at all.
++ *
++ * reserved-plane does exactly one thing on this SoC, and it is the one thing
++ * that matters: it switches Linux's commits on vp3 from the per-port cfg_done
++ * register to the per-window one (rockchip_drm_vop2.c:1961), and the bitmask
++ * written there only ever contains windows Linux itself touched in that commit
++ * (:2307). Register writes made from the other core therefore sit in the VOP's
++ * shadow copy until that core commits them, instead of being latched by whatever
++ * frame Linux happens to be pushing.
++ *
++ * It does not also do the layer routing that the same property does on RK3576:
++ * that code (:12580) is inside vop3_setup_layer_sel_for_vp(), and is_vop3()
++ * returns false for RK3588 (:1260), so RK3588 goes through
++ * vop2_setup_layer_mixer_for_vp() (:13259), which has no notion of a reserved
++ * plane. Hence the win_mask reasoning above.
++ *
++ * Two consequences of Esmart3 staying in the mask, both accepted:
++ * vop2_disable_all_planes_for_crtc() walks win_mask and does not skip reserved
++ * planes, so a modeset or CRTC shutdown (call sites 5996/9078/10630/13949) will
++ * switch the window off - the other core reprograms it every frame, so that
++ * costs one frame rather than the display. And Linux still registers a DRM plane
++ * for Esmart3, so nothing but discipline stops a client from binding it; there
++ * is no compositor on this target.
++ *
++ * The window's power domain is not a worry on this SoC: the driver turns PD_ESMART
++ * on at init and refuses to control it dynamically
++ * (rockchip_drm_vop2.c:4781 and vop2_ignore_dynamic_control_sub_pd()).
++ */
++
++&vp0 {
++	rockchip,plane-mask = <((1 << ROCKCHIP_VOP2_CLUSTER0) | (1 << ROCKCHIP_VOP2_ESMART0))>;
++	rockchip,primary-plane = <ROCKCHIP_VOP2_ESMART0>;
++};
++
++&vp1 {
++	rockchip,plane-mask = <((1 << ROCKCHIP_VOP2_CLUSTER1) | (1 << ROCKCHIP_VOP2_ESMART1))>;
++	rockchip,primary-plane = <ROCKCHIP_VOP2_ESMART1>;
++};
++
++&vp2 {
++	rockchip,plane-mask = <((1 << ROCKCHIP_VOP2_CLUSTER2) | (1 << ROCKCHIP_VOP2_ESMART2))>;
++	rockchip,primary-plane = <ROCKCHIP_VOP2_ESMART2>;
++};
++
++&vp3 {
++	rockchip,plane-mask = <((1 << ROCKCHIP_VOP2_CLUSTER3) | (1 << ROCKCHIP_VOP2_ESMART3))>;
++	rockchip,primary-plane = <ROCKCHIP_VOP2_CLUSTER3>;
++	rockchip,reserved-plane = <ROCKCHIP_VOP2_ESMART3>;
++};
++
++/*
++ * The VOP's IOMMU has to go, because a plane driven from another core can only be
++ * given a physical address. With no IOMMU the DRM side does not merely tolerate
++ * that - it switches to it: rockchip_gem_create_object() forces contiguous
++ * allocation and programs dma_handle rather than an IOVA when private->domain is
++ * NULL (rockchip_drm_gem.c:455). Both sides then speak physical addresses.
++ *
++ * Evidence that this is needed rather than assumed: with the IOMMU on, the plane's
++ * address reads back as 0x0 in /sys/kernel/debug/dri/0/summary, which cannot be a
++ * physical address on this board - the first IOVA handed out is zero.
++ *
++ * Cost: every DRM buffer becomes CMA. There is a 256MB CMA pool and no compositor
++ * running here, and video decode has its own IOMMU, so nothing else is affected.
++ */
++
++&vop_mmu {
++	status = "disabled";
++};
++
++/* Drop the stock amp-shmem@8200000 (overlaps OP-TEE @0x08400000); replaced above */
++/delete-node/ &amp_shmem_reserved;
++
++/* cpu_l3 is owned by the AMP firmware; remove from Linux */
++/delete-node/ &cpu_l3;
+diff --git a/arch/arm64/configs/rk3588_g610.config b/arch/arm64/configs/rk3588_g610.config
+new file mode 100644
+index 000000000..43a4a06e8
+--- /dev/null
++++ b/arch/arm64/configs/rk3588_g610.config
+@@ -0,0 +1,7 @@
++# RK3588 Mali G610 (Valhall/Bifrost, CSF) GPU driver
++# CONFIG_MALI400 is not set
++# CONFIG_MALI_MIDGARD is not set
++CONFIG_MALI_BIFROST=y
++CONFIG_MALI_CSF_SUPPORT=y
++CONFIG_MALI_BIFROST_DEVFREQ=y
++CONFIG_MALI_PLATFORM_NAME="rk"
+diff --git a/arch/arm64/configs/rk3588_wifibt.config b/arch/arm64/configs/rk3588_wifibt.config
+new file mode 100644
+index 000000000..5172d730a
+--- /dev/null
++++ b/arch/arm64/configs/rk3588_wifibt.config
+@@ -0,0 +1,9 @@
++# RK3588 EVB7 AP6398S WiFi/BT
++# AP6XXX=m -> bcmdhd built as loadable module (dhd), loaded post-boot AFTER
++# rfkill-wlan deferred-probe completes -> gets valid WL_REG_ON GPIO (fixes race).
++CONFIG_WL_ROCKCHIP=y
++CONFIG_BCMDHD=y
++CONFIG_AP6XXX=m
++CONFIG_BCMDHD_SDIO=y
++# CONFIG_WIFI_LOAD_DRIVER_WHEN_KERNEL_BOOTUP is not set
++# CONFIG_WIFI_BUILD_MODULE is not set
+diff --git a/arch/arm64/configs/rockchip_linux_defconfig b/arch/arm64/configs/rockchip_linux_defconfig
+index c20580b6e..57c281c63 100644
+--- a/arch/arm64/configs/rockchip_linux_defconfig
++++ b/arch/arm64/configs/rockchip_linux_defconfig
+@@ -548,6 +548,9 @@ CONFIG_ROCKCHIP_IOMMU=y
+ CONFIG_ARM_SMMU_V3=y
+ CONFIG_RPMSG_ROCKCHIP_MBOX=y
+ CONFIG_RPMSG_VIRTIO=y
++CONFIG_RPMSG_CHAR=m
++CONFIG_RPMSG_CTRL=m
++CONFIG_RPMSG_NSH_TTY=m
+ CONFIG_CPU_RV1126B=y
+ CONFIG_CPU_PX30=y
+ CONFIG_CPU_RK1808=y
+diff --git a/drivers/tty/Kconfig b/drivers/tty/Kconfig
+index cc30ff93e..862620c96 100644
+--- a/drivers/tty/Kconfig
++++ b/drivers/tty/Kconfig
+@@ -380,6 +380,22 @@ config RPMSG_TTY
+ 	  To compile this driver as a module, choose M here: the module will be
+ 	  called rpmsg_tty.
+ 
++config RPMSG_NSH_TTY
++	tristate "RPMSG tty driver for NuttX nsh console (uart_rpmsg framing)"
++	depends on RPMSG
++	help
++	  Export a NuttX (openvela) uart_rpmsg console endpoint as a tty device
++	  (/dev/ttyNSHx), so user space (microcom/cu) can open an interactive
++	  NuttX nsh shell over rpmsg -- sharing one physical UART between Linux
++	  and an AMP remote core.
++
++	  Unlike the generic RPMSG_TTY driver (raw bytes, "rpmsg-tty" service),
++	  this one speaks NuttX's uart_rpmsg header framing and binds the
++	  "rpmsg-ttyproxy" service. It uses a distinct device name (ttyNSH) so it
++	  can coexist with RPMSG_TTY.
++
++	  To compile as a module choose M here: the module is called rpmsg_nsh_tty.
++
+ endif # TTY
+ 
+ source "drivers/tty/serdev/Kconfig"
+diff --git a/drivers/tty/Makefile b/drivers/tty/Makefile
+index 07aca5184..6a69d32dd 100644
+--- a/drivers/tty/Makefile
++++ b/drivers/tty/Makefile
+@@ -27,5 +27,6 @@ obj-$(CONFIG_GOLDFISH_TTY)	+= goldfish.o
+ obj-$(CONFIG_MIPS_EJTAG_FDC_TTY) += mips_ejtag_fdc.o
+ obj-$(CONFIG_VCC)		+= vcc.o
+ obj-$(CONFIG_RPMSG_TTY)		+= rpmsg_tty.o
++obj-$(CONFIG_RPMSG_NSH_TTY)	+= rpmsg_nsh_tty.o
+ 
+ obj-y += ipwireless/
+diff --git a/drivers/tty/rpmsg_nsh_tty.c b/drivers/tty/rpmsg_nsh_tty.c
+new file mode 100644
+index 000000000..27e54ee46
+--- /dev/null
++++ b/drivers/tty/rpmsg_nsh_tty.c
+@@ -0,0 +1,433 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * rpmsg_nsh_tty - Linux tty front-end for a NuttX (openvela) uart_rpmsg
++ * console channel, so a Linux user-space program (microcom/cu/agetty) can
++ * open an interactive NuttX nsh shell over rpmsg -- i.e. share the single
++ * physical UART2 line between Linux and the AMP core (cpu_l3) with no second
++ * serial cable.
++ *
++ * Why not the upstream drivers/tty/rpmsg_tty.c?
++ *   The upstream driver binds the "rpmsg-tty" service and exchanges RAW bytes.
++ *   NuttX's drivers/serial/uart_rpmsg.c instead wraps every packet in a small
++ *   header (command/response/result/cookie + count) and expects a per-write
++ *   response for flow control. This driver speaks that exact framing.
++ *
++ * Wire protocol (must match NuttX drivers/serial/uart_rpmsg.c):
++ *   struct urpmsg_header { u32 command; s32 result; u64 cookie; }  // 16 bytes
++ *     command bits[30:0] = command id, bit31 = response flag
++ *   struct urpmsg_write  { header; u32 count; u32 resolved; u8 data[]; } // 24+
++ *   command ids: TTY_WRITE = 0, TTY_WAKEUP = 1
++ *
++ *   TX (Linux -> NuttX): send TTY_WRITE, response=0, count=len, data=bytes.
++ *   RX (NuttX -> Linux): a TTY_WRITE with response=0 carries nsh output; we
++ *     push it to the tty, then echo the header back with response=1 and
++ *     result = bytes accepted (NuttX uses this to release its TX buffer).
++ *   A message with response=1 is the ack to one of OUR writes.
++ *   TTY_WAKEUP means the peer freed buffer space (flow control); we rely on
++ *   rpmsg_trysend back-pressure instead, so it is a no-op here.
++ *
++ * This driver exposes /dev/ttyNSHx and binds the "rpmsg-ttyproxy" service, so
++ * it coexists with the upstream CONFIG_RPMSG_TTY driver (/dev/ttyRPMSGx,
++ * "rpmsg-tty" service) without conflict.
++ *
++ * Copyright (c) 2026
++ */
++
++#define pr_fmt(fmt)		KBUILD_MODNAME ": " fmt
++
++#include <linux/idr.h>
++#include <linux/module.h>
++#include <linux/rpmsg.h>
++#include <linux/slab.h>
++#include <linux/tty.h>
++#include <linux/tty_flip.h>
++#include <linux/workqueue.h>
++
++#define RPMSG_NSH_TTY_NAME	"ttyNSH"
++#define MAX_TTY_RPMSG		32
++
++/* uart_rpmsg command ids (low 31 bits of header.command) */
++#define URPMSG_TTY_WRITE	0u
++#define URPMSG_TTY_WAKEUP	1u
++/* header.command bit31 = response flag */
++#define URPMSG_RESP_FLAG	0x80000000u
++
++struct urpmsg_header {
++	__le32	command;	/* bits[30:0] = cmd id, bit31 = response */
++	__le32	result;
++	__le64	cookie;
++} __packed;
++
++struct urpmsg_write {
++	struct urpmsg_header	header;
++	__le32			count;
++	__le32			resolved;
++	u8			data[];
++} __packed;
++
++static DEFINE_IDR(tty_idr);
++static DEFINE_MUTEX(idr_lock);
++
++static struct tty_driver *rpmsg_nsh_tty_driver;
++
++struct rpmsg_nsh_port {
++	struct tty_port		port;
++	int			id;
++	struct rpmsg_device	*rpdev;
++	struct work_struct	ack_work;    /* deferred ack sender */
++	atomic_t		ack_result;  /* bytes accepted, echoed in ack */
++	__le64			ack_cookie;  /* NuttX cookie echoed in ack */
++};
++
++/* Deferred ack sender. rpmsg_trysend() must NOT be called from the rpmsg RX
++ * callback context (re-entering the rpmsg TX path from within RX corrupted the
++ * kernel slab allocator). Instead the RX callback records the result/cookie
++ * and schedules this work, which sends the ack from plain process context.
++ */
++
++static void rpmsg_nsh_ack_work(struct work_struct *work)
++{
++	struct rpmsg_nsh_port *cport =
++		container_of(work, struct rpmsg_nsh_port, ack_work);
++	struct urpmsg_write ack;
++	int copied = atomic_read(&cport->ack_result);
++
++	memset(&ack, 0, sizeof(ack));
++	ack.header.command = cpu_to_le32(URPMSG_TTY_WRITE | URPMSG_RESP_FLAG);
++	ack.header.result  = cpu_to_le32(copied);
++	ack.header.cookie  = cport->ack_cookie;
++	ack.count          = cpu_to_le32(copied);
++
++	rpmsg_trysend(cport->rpdev->ept, &ack, sizeof(ack));
++}
++
++/* NuttX sent us bytes (nsh output) -> push to tty, then ack with response=1 */
++static int rpmsg_nsh_handle_write(struct rpmsg_device *rpdev,
++				  struct urpmsg_write *msg, int len)
++{
++	struct rpmsg_nsh_port *cport = dev_get_drvdata(&rpdev->dev);
++	u32 count = le32_to_cpu(msg->count);
++	int avail, copied = 0;
++
++	if (!cport)
++		return -ENXIO;
++
++	/* Explicit int math: len and sizeof mixed would promote to unsigned. */
++	avail = len - (int)sizeof(struct urpmsg_write);
++	if (avail < 0)
++		return -EINVAL;
++	if (count > (u32)avail)
++		count = (u32)avail;
++
++	if (count) {
++		copied = tty_insert_flip_string(&cport->port, msg->data, count);
++		if (copied != count)
++			dev_warn_ratelimited(&rpdev->dev,
++				"tty buffer full: dropped %u bytes\n",
++				count - copied);
++		tty_flip_buffer_push(&cport->port);
++	}
++
++	/* Defer the ack: do NOT call rpmsg_trysend() from this RX callback
++	 * context. Re-entering the rpmsg TX path from within RX corrupted the
++	 * kernel slab allocator (Oops in __kmem_cache_alloc_node). Record the
++	 * result/cookie and let rpmsg_nsh_ack_work() send it from process context.
++	 * NuttX issues one write at a time and does not validate the cookie, so a
++	 * single pending-ack slot is enough.
++	 */
++	atomic_set(&cport->ack_result, copied);
++	cport->ack_cookie = msg->header.cookie;
++	schedule_work(&cport->ack_work);
++
++	return 0;
++}
++
++static int rpmsg_nsh_tty_cb(struct rpmsg_device *rpdev, void *data, int len,
++			    void *priv, u32 src)
++{
++	struct urpmsg_write *msg = data;
++	u32 command;
++
++	if (len < (int)sizeof(struct urpmsg_header)) {
++		dev_err_ratelimited(&rpdev->dev, "short rpmsg: %d\n", len);
++		return -EINVAL;
++	}
++
++	command = le32_to_cpu(msg->header.command);
++
++	if (command & URPMSG_RESP_FLAG) {
++		/* Ack to one of our TX writes; back-pressure handled by trysend. */
++		return 0;
++	}
++
++	switch (command & ~URPMSG_RESP_FLAG) {
++	case URPMSG_TTY_WRITE:
++		if (len < (int)sizeof(struct urpmsg_write)) {
++			dev_err_ratelimited(&rpdev->dev, "short write msg: %d\n", len);
++			return -EINVAL;
++		}
++		return rpmsg_nsh_handle_write(rpdev, msg, len);
++	case URPMSG_TTY_WAKEUP:
++		/* Peer freed space; nothing queued on our side. */
++		return 0;
++	default:
++		dev_dbg_ratelimited(&rpdev->dev, "unknown cmd 0x%x\n", command);
++		return 0;
++	}
++}
++
++static int rpmsg_nsh_tty_install(struct tty_driver *driver, struct tty_struct *tty)
++{
++	struct rpmsg_nsh_port *cport = idr_find(&tty_idr, tty->index);
++	struct tty_port *port;
++
++	if (!cport)
++		return -ENODEV;
++
++	tty->driver_data = cport;
++
++	/* Take a port reference for this tty; released in rpmsg_nsh_tty_cleanup()
++	 * via tty_port_put(). Without this get the kref goes 1->0 on the first
++	 * close, freeing cport while the idr and a future open still reference
++	 * it -> use-after-free (crash in tty_port_open acquiring port->lock).
++	 */
++	port = tty_port_get(&cport->port);
++	return tty_port_install(port, driver, tty);
++}
++
++static void rpmsg_nsh_tty_cleanup(struct tty_struct *tty)
++{
++	tty_port_put(tty->port);
++}
++
++static int rpmsg_nsh_tty_open(struct tty_struct *tty, struct file *filp)
++{
++	return tty_port_open(tty->port, tty, filp);
++}
++
++static void rpmsg_nsh_tty_close(struct tty_struct *tty, struct file *filp)
++{
++	tty_port_close(tty->port, tty, filp);
++}
++
++/* User typed something (into nsh) -> wrap in TTY_WRITE and send to NuttX. */
++static int rpmsg_nsh_tty_write(struct tty_struct *tty, const u8 *buf, int len)
++{
++	struct rpmsg_nsh_port *cport = tty->driver_data;
++	struct rpmsg_device *rpdev = cport->rpdev;
++	struct urpmsg_write *msg;
++	int mtu, room, msg_size, ret;
++	u8 txbuf[512];
++
++	if (len <= 0)
++		return 0;
++
++	mtu = rpmsg_get_mtu(rpdev->ept);
++	if (mtu < 0)
++		return mtu;
++
++	room = mtu - sizeof(*msg);
++	if (room <= 0)
++		return -EMSGSIZE;
++	if (room > (int)(sizeof(txbuf) - sizeof(*msg)))
++		room = sizeof(txbuf) - sizeof(*msg);
++	if (len > room)
++		len = room;
++
++	msg = (struct urpmsg_write *)txbuf;
++	memset(msg, 0, sizeof(*msg));
++	msg->header.command = cpu_to_le32(URPMSG_TTY_WRITE); /* response = 0 */
++	msg->header.result  = cpu_to_le32(-ENXIO);
++	msg->count          = cpu_to_le32(len);
++	memcpy(msg->data, buf, len);
++
++	msg_size = sizeof(*msg) + len;
++
++	/* trysend so the caller is not blocked when no rpmsg buffer is free. */
++	ret = rpmsg_trysend(rpdev->ept, msg, msg_size);
++	if (ret) {
++		dev_dbg_ratelimited(&rpdev->dev, "trysend failed: %d\n", ret);
++		return ret;
++	}
++
++	return len;
++}
++
++static unsigned int rpmsg_nsh_tty_write_room(struct tty_struct *tty)
++{
++	struct rpmsg_nsh_port *cport = tty->driver_data;
++	int mtu;
++
++	mtu = rpmsg_get_mtu(cport->rpdev->ept);
++	if (mtu < (int)sizeof(struct urpmsg_write))
++		return 0;
++
++	return mtu - sizeof(struct urpmsg_write);
++}
++
++static void rpmsg_nsh_tty_hangup(struct tty_struct *tty)
++{
++	tty_port_hangup(tty->port);
++}
++
++static const struct tty_operations rpmsg_nsh_tty_ops = {
++	.install	= rpmsg_nsh_tty_install,
++	.open		= rpmsg_nsh_tty_open,
++	.close		= rpmsg_nsh_tty_close,
++	.write		= rpmsg_nsh_tty_write,
++	.write_room	= rpmsg_nsh_tty_write_room,
++	.hangup		= rpmsg_nsh_tty_hangup,
++	.cleanup	= rpmsg_nsh_tty_cleanup,
++};
++
++static void rpmsg_nsh_destruct_port(struct tty_port *port)
++{
++	struct rpmsg_nsh_port *cport =
++		container_of(port, struct rpmsg_nsh_port, port);
++
++	mutex_lock(&idr_lock);
++	idr_remove(&tty_idr, cport->id);
++	mutex_unlock(&idr_lock);
++
++	kfree(cport);
++}
++
++static const struct tty_port_operations rpmsg_nsh_port_ops = {
++	.destruct = rpmsg_nsh_destruct_port,
++};
++
++static int rpmsg_nsh_tty_probe(struct rpmsg_device *rpdev)
++{
++	struct rpmsg_nsh_port *cport;
++	struct device *dev = &rpdev->dev;
++	struct device *tty_dev;
++	int ret;
++
++	cport = kzalloc(sizeof(*cport), GFP_KERNEL);
++	if (!cport)
++		return -ENOMEM;
++
++	mutex_lock(&idr_lock);
++	ret = idr_alloc(&tty_idr, cport, 0, MAX_TTY_RPMSG, GFP_KERNEL);
++	mutex_unlock(&idr_lock);
++	if (ret < 0) {
++		kfree(cport);
++		return ret;
++	}
++	cport->id = ret;
++
++	tty_port_init(&cport->port);
++	cport->port.ops = &rpmsg_nsh_port_ops;
++	INIT_WORK(&cport->ack_work, rpmsg_nsh_ack_work);
++
++	tty_dev = tty_port_register_device(&cport->port, rpmsg_nsh_tty_driver,
++					   cport->id, dev);
++	if (IS_ERR(tty_dev)) {
++		ret = dev_err_probe(dev, PTR_ERR(tty_dev),
++				    "failed to register tty port\n");
++		mutex_lock(&idr_lock);
++		idr_remove(&tty_idr, cport->id);
++		mutex_unlock(&idr_lock);
++		tty_port_put(&cport->port);
++		return ret;
++	}
++
++	cport->rpdev = rpdev;
++	dev_set_drvdata(dev, cport);
++
++	/* Announce our endpoint address back to the NuttX side so it learns
++	 * where to send (mirrors rockchip_rpmsg_test).
++	 */
++	rpdev->announce = rpdev->src != RPMSG_ADDR_ANY;
++
++	dev_info(dev, "new NuttX nsh channel 0x%x -> 0x%x: %s%d\n",
++		 rpdev->src, rpdev->dst, RPMSG_NSH_TTY_NAME, cport->id);
++
++	return 0;
++}
++
++static void rpmsg_nsh_tty_remove(struct rpmsg_device *rpdev)
++{
++	struct rpmsg_nsh_port *cport = dev_get_drvdata(&rpdev->dev);
++
++	/* Flush any pending deferred ack before the port (and cport) go away. */
++	cancel_work_sync(&cport->ack_work);
++
++	tty_port_tty_hangup(&cport->port, false);
++	tty_unregister_device(rpmsg_nsh_tty_driver, cport->id);
++	tty_port_put(&cport->port);
++}
++
++/* One entry per NuttX instance that exports a console. The name is what the
++ * remote passes to uart_rpmsg_init(), prefixed with "rpmsg-tty": "proxy" for the
++ * NuttX on cpu_l3, "m0" for the one on the PMU Cortex-M0. They arrive on
++ * different virtio buses, so each gets its own /dev/ttyNSHx.
++ */
++static struct rpmsg_device_id rpmsg_nsh_tty_id_table[] = {
++	{ .name = "rpmsg-ttyproxy" },
++	{ .name = "rpmsg-ttym0" },
++	{ /* sentinel */ },
++};
++MODULE_DEVICE_TABLE(rpmsg, rpmsg_nsh_tty_id_table);
++
++static struct rpmsg_driver rpmsg_nsh_tty_rpmsg_drv = {
++	.drv.name	= KBUILD_MODNAME,
++	.id_table	= rpmsg_nsh_tty_id_table,
++	.probe		= rpmsg_nsh_tty_probe,
++	.callback	= rpmsg_nsh_tty_cb,
++	.remove		= rpmsg_nsh_tty_remove,
++};
++
++static int __init rpmsg_nsh_tty_init(void)
++{
++	int ret;
++
++	rpmsg_nsh_tty_driver = tty_alloc_driver(MAX_TTY_RPMSG,
++			TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV);
++	if (IS_ERR(rpmsg_nsh_tty_driver))
++		return PTR_ERR(rpmsg_nsh_tty_driver);
++
++	rpmsg_nsh_tty_driver->driver_name = "rpmsg_nsh_tty";
++	rpmsg_nsh_tty_driver->name = RPMSG_NSH_TTY_NAME;
++	rpmsg_nsh_tty_driver->major = 0;
++	rpmsg_nsh_tty_driver->type = TTY_DRIVER_TYPE_CONSOLE;
++	rpmsg_nsh_tty_driver->init_termios = tty_std_termios;
++	/* raw: nsh does its own echo/line-editing */
++	rpmsg_nsh_tty_driver->init_termios.c_lflag &= ~(ECHO | ICANON);
++	rpmsg_nsh_tty_driver->init_termios.c_oflag &= ~(OPOST | ONLCR);
++	tty_set_operations(rpmsg_nsh_tty_driver, &rpmsg_nsh_tty_ops);
++
++	ret = tty_register_driver(rpmsg_nsh_tty_driver);
++	if (ret < 0) {
++		pr_err("failed to register tty driver: %d\n", ret);
++		goto err_put;
++	}
++
++	ret = register_rpmsg_driver(&rpmsg_nsh_tty_rpmsg_drv);
++	if (ret < 0) {
++		pr_err("failed to register rpmsg driver: %d\n", ret);
++		goto err_unregister;
++	}
++
++	return 0;
++
++err_unregister:
++	tty_unregister_driver(rpmsg_nsh_tty_driver);
++err_put:
++	tty_driver_kref_put(rpmsg_nsh_tty_driver);
++	return ret;
++}
++
++static void __exit rpmsg_nsh_tty_exit(void)
++{
++	unregister_rpmsg_driver(&rpmsg_nsh_tty_rpmsg_drv);
++	tty_unregister_driver(rpmsg_nsh_tty_driver);
++	tty_driver_kref_put(rpmsg_nsh_tty_driver);
++	idr_destroy(&tty_idr);
++}
++
++module_init(rpmsg_nsh_tty_init);
++module_exit(rpmsg_nsh_tty_exit);
++
++MODULE_DESCRIPTION("Linux tty front-end for NuttX uart_rpmsg (nsh over rpmsg)");
++MODULE_LICENSE("GPL v2");

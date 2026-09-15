@@ -1,0 +1,1807 @@
+diff --git a/examples/ampcam/Kconfig b/examples/ampcam/Kconfig
+new file mode 100644
+index 000000000..1bdfcb0ba
+--- /dev/null
++++ b/examples/ampcam/Kconfig
+@@ -0,0 +1,31 @@
++#
++# For a description of the syntax of this configuration file,
++# see the file kconfig-language.txt in the NuttX tools repository.
++#
++
++config EXAMPLES_AMPCAM
++	tristate "AMP shared-memory camera viewer"
++	default n
++	---help---
++		Read frames that the Linux side captured and published in the AMP
++		shared carveout, and either draw them to the framebuffer or just
++		report what the transport is doing.
++
++		Needs a board that provides /dev/amcam0 - currently the RK3588
++		EVB7 AMP configuration.
++
++if EXAMPLES_AMPCAM
++
++config EXAMPLES_AMPCAM_PROGNAME
++	string "Program name"
++	default "ampcam"
++
++config EXAMPLES_AMPCAM_PRIORITY
++	int "Task priority"
++	default 100
++
++config EXAMPLES_AMPCAM_STACKSIZE
++	int "Stack size"
++	default DEFAULT_TASK_STACKSIZE
++
++endif
+diff --git a/examples/ampcam/Make.defs b/examples/ampcam/Make.defs
+new file mode 100644
+index 000000000..f6cfdcaf8
+--- /dev/null
++++ b/examples/ampcam/Make.defs
+@@ -0,0 +1,23 @@
++############################################################################
++# apps/examples/ampcam/Make.defs
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.  The
++# ASF licenses this file to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance with the
++# License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
++# License for the specific language governing permissions and limitations
++# under the License.
++#
++############################################################################
++
++ifneq ($(CONFIG_EXAMPLES_AMPCAM),)
++CONFIGURED_APPS += $(APPDIR)/examples/ampcam
++endif
+diff --git a/examples/ampcam/Makefile b/examples/ampcam/Makefile
+new file mode 100644
+index 000000000..19fdcbde5
+--- /dev/null
++++ b/examples/ampcam/Makefile
+@@ -0,0 +1,32 @@
++############################################################################
++# apps/examples/ampcam/Makefile
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.  The
++# ASF licenses this file to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance with the
++# License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
++# License for the specific language governing permissions and limitations
++# under the License.
++#
++############################################################################
++
++include $(APPDIR)/Make.defs
++
++# AMP shared-memory camera viewer
++
++PROGNAME  = $(CONFIG_EXAMPLES_AMPCAM_PROGNAME)
++PRIORITY  = $(CONFIG_EXAMPLES_AMPCAM_PRIORITY)
++STACKSIZE = $(CONFIG_EXAMPLES_AMPCAM_STACKSIZE)
++MODULE    = $(CONFIG_EXAMPLES_AMPCAM)
++
++MAINSRC = ampcam_main.c
++
++include $(APPDIR)/Application.mk
+diff --git a/examples/ampcam/ampcam_main.c b/examples/ampcam/ampcam_main.c
+new file mode 100644
+index 000000000..012aae1e1
+--- /dev/null
++++ b/examples/ampcam/ampcam_main.c
+@@ -0,0 +1,740 @@
++/****************************************************************************
++ * apps/examples/ampcam/ampcam_main.c
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.  The
++ * ASF licenses this file to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the
++ * License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
++ * License for the specific language governing permissions and limitations
++ * under the License.
++ *
++ ****************************************************************************/
++
++/* Show the frames Linux is capturing, and say what the transport is doing.
++ *
++ * This is the consumer end of the camera path on the RK3588 EVB7 AMP setup:
++ * Linux drives the imx415 through its ISP, converts each frame to XRGB8888 and
++ * publishes it in the shared carveout; this core reads it out of /dev/amcam0.
++ *
++ * There are two modes and the statistics one matters as much as the picture. A
++ * camera preview that looks wrong tells you very little - a black screen is a
++ * dead sensor, a dead pipeline, a dead notification path, a bad descriptor or a
++ * blit into the wrong buffer, and they are indistinguishable by eye. So -s
++ * reports frames, gaps, torn reads and rejected descriptors without touching the
++ * display at all, which separates "the data is not arriving" from "the data is
++ * arriving and I am drawing it wrong".
++ */
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <nuttx/config.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <time.h>
++#include <unistd.h>
++
++#include <nuttx/video/fb.h>
++
++#include <arch/board/board.h>
++
++/****************************************************************************
++ * Private Types
++ ****************************************************************************/
++
++struct ampcam_fb_s
++{
++  int fd;
++  uint8_t *mem;
++  size_t len;
++  uint32_t stride;
++  uint32_t width;
++  uint32_t height;
++  uint32_t bpp;
++};
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: now_ms
++ ****************************************************************************/
++
++static uint64_t now_ms(void)
++{
++  struct timespec ts;
++
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return (uint64_t)ts.tv_sec * 1000 + (uint64_t)(ts.tv_nsec / 1000000);
++}
++
++/****************************************************************************
++ * Name: wait_for_stream
++ *
++ * Description:
++ *   Poll the geometry until Linux publishes something. Separate from the read
++ *   loop and noisy about it, because "nothing on screen" at this stage means the
++ *   Linux side is not streaming, and that is a completely different thing to
++ *   investigate than a transport fault.
++ *
++ ****************************************************************************/
++
++static int wait_for_stream(int fd, struct ampcam_geom_s *geom, int timeout_s)
++{
++  uint64_t deadline = now_ms() + (uint64_t)timeout_s * 1000;
++  bool announced = false;
++
++  for (; ; )
++    {
++      if (ioctl(fd, AMPCAMIOC_GETGEOM, (unsigned long)geom) < 0)
++        {
++          fprintf(stderr, "ampcam: GETGEOM: %s\n", strerror(errno));
++          return -1;
++        }
++
++      if (geom->width != 0 && geom->height != 0)
++        {
++          printf("ampcam: stream is up, %" PRIu32 "x%" PRIu32
++                 ", %" PRIu32 " bpp, seq %" PRIu32 "\n",
++                 geom->width, geom->height, geom->bpp, geom->seq);
++          return 0;
++        }
++
++      if (now_ms() >= deadline)
++        {
++          fprintf(stderr,
++                  "ampcam: no frames after %d s. Linux is not streaming -"
++                  " start the capture side and try again.\n", timeout_s);
++          return -1;
++        }
++
++      if (!announced)
++        {
++          printf("ampcam: waiting for Linux to start streaming...\n");
++          announced = true;
++        }
++
++      usleep(200000);
++    }
++}
++
++/****************************************************************************
++ * Name: fb_setup
++ ****************************************************************************/
++
++static int fb_setup(struct ampcam_fb_s *fb, const char *path)
++{
++  struct fb_videoinfo_s vinfo;
++  struct fb_planeinfo_s pinfo;
++
++  fb->fd = open(path, O_RDWR);
++  if (fb->fd < 0)
++    {
++      fprintf(stderr, "ampcam: %s: %s\n", path, strerror(errno));
++      return -1;
++    }
++
++  if (ioctl(fb->fd, FBIOGET_VIDEOINFO, (unsigned long)&vinfo) < 0 ||
++      ioctl(fb->fd, FBIOGET_PLANEINFO, (unsigned long)&pinfo) < 0)
++    {
++      fprintf(stderr, "ampcam: %s: cannot read fb info: %s\n",
++              path, strerror(errno));
++      close(fb->fd);
++      return -1;
++    }
++
++  /* Only 32-bit is handled, and refusing anything else is deliberate. The whole
++   * point of converting on the Linux side was that the bytes in shared memory
++   * are already what the framebuffer wants; a 16-bit panel here would mean the
++   * conversion belongs on the other side of the link, not bolted on in this
++   * viewer.
++   */
++
++  if (pinfo.bpp != 32)
++    {
++      fprintf(stderr, "ampcam: %s is %u bpp, this needs 32\n",
++              path, pinfo.bpp);
++      close(fb->fd);
++      return -1;
++    }
++
++  fb->mem = mmap(NULL, pinfo.fblen, PROT_READ | PROT_WRITE, MAP_SHARED,
++                 fb->fd, 0);
++  if (fb->mem == MAP_FAILED)
++    {
++      fprintf(stderr, "ampcam: mmap %s: %s\n", path, strerror(errno));
++      close(fb->fd);
++      return -1;
++    }
++
++  fb->len    = pinfo.fblen;
++  fb->stride = pinfo.stride;
++  fb->width  = vinfo.xres;
++  fb->height = vinfo.yres;
++  fb->bpp    = pinfo.bpp;
++
++  printf("ampcam: %s is %" PRIu32 "x%" PRIu32 ", stride %" PRIu32
++         ", %zu bytes mapped\n",
++         path, fb->width, fb->height, fb->stride, fb->len);
++  return 0;
++}
++
++/****************************************************************************
++ * Name: fb_blit
++ *
++ * Description:
++ *   Copy the frame into the first buffer at x0/y0 and publish just those rows.
++ *
++ *   Only the first buffer is used, and only FBIO_UPDATE is issued. The
++ *   framebuffer here is double-buffered, but its driver documents that a program
++ *   which only updates is writing into the buffer already on screen and gets
++ *   published immediately - so taking the pan path as well would add the whole
++ *   buffer-swap and vsync-wait dance for no gain in a viewer that has nothing
++ *   else to do while it waits.
++ *
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: fb_hline / fb_vline
++ *
++ * Description:
++ *   Two-pixel lines, clipped to the framebuffer.
++ *
++ *   Clipped rather than trusted, because the coordinates come from boxes that
++ *   were produced on the other core. A box one pixel outside the frame is a
++ *   plausible rounding result from the scaling Linux does; writing it without
++ *   clipping is a stray store into whatever follows the framebuffer.
++ *
++ ****************************************************************************/
++
++static void fb_hline(struct ampcam_fb_s *fb, int x, int y, int len,
++                     uint32_t colour)
++{
++  int t;
++
++  for (t = 0; t < 2; t++, y++)
++    {
++      uint32_t *row;
++      int i;
++
++      if (y < 0 || y >= (int)fb->height)
++        {
++          continue;
++        }
++
++      row = (uint32_t *)(fb->mem + (size_t)y * fb->stride);
++
++      for (i = 0; i < len; i++)
++        {
++          int px = x + i;
++
++          if (px >= 0 && px < (int)fb->width)
++            {
++              row[px] = colour;
++            }
++        }
++    }
++}
++
++static void fb_vline(struct ampcam_fb_s *fb, int x, int y, int len,
++                     uint32_t colour)
++{
++  int i;
++
++  for (i = 0; i < len; i++)
++    {
++      int py = y + i;
++      uint32_t *row;
++      int t;
++
++      if (py < 0 || py >= (int)fb->height)
++        {
++          continue;
++        }
++
++      row = (uint32_t *)(fb->mem + (size_t)py * fb->stride);
++
++      for (t = 0; t < 2; t++)
++        {
++          int px = x + t;
++
++          if (px >= 0 && px < (int)fb->width)
++            {
++              row[px] = colour;
++            }
++        }
++    }
++}
++
++/****************************************************************************
++ * Name: fb_draw_boxes
++ *
++ * Description:
++ *   Outline every detection over the frame just blitted, plus a bar whose
++ *   length is the confidence.
++ *
++ *   A bar rather than a number because there is no font here. That is not a
++ *   placeholder for text: a bar is read at a glance from across a desk, which
++ *   is how a preview like this actually gets looked at, and it needs none of the
++ *   glyph handling that would have to be thrown away when this moves to LVGL.
++ *
++ *   Boxes arrive in the coordinate space of the frame, so the only transform
++ *   applied here is the offset this program chose when it centred the image.
++ *   That split is the contract: the other side resolves the sensor, the second
++ *   ISP stream and the model's letterbox, and this side adds the one thing it
++ *   knows and the other side cannot see.
++ *
++ ****************************************************************************/
++
++static void fb_draw_boxes(struct ampcam_fb_s *fb,
++                          const struct ampcam_detect_s *det,
++                          uint32_t fw, uint32_t fh, uint32_t x0, uint32_t y0)
++{
++  int i;
++
++  if (det->count <= 0 || det->width == 0 || det->height == 0)
++    {
++      return;
++    }
++
++  for (i = 0; i < det->count; i++)
++    {
++      const struct ampcam_box_s *b = &det->box[i];
++      uint32_t colour;
++      int bx;
++      int by;
++      int bw;
++      int bh;
++      int bar;
++
++      /* Scaled, in case the detector's coordinate space is not the frame's.
++       * They are the same today - Linux publishes boxes in the published
++       * frame's space - but the descriptor carries its own width and height
++       * precisely so that this does not become an assumption which breaks
++       * silently the first time either resolution changes.
++       */
++
++      bx = (int)x0 + (int)((uint64_t)b->x * fw / det->width);
++      by = (int)y0 + (int)((uint64_t)b->y * fh / det->height);
++      bw = (int)((uint64_t)b->w * fw / det->width);
++      bh = (int)((uint64_t)b->h * fh / det->height);
++
++      if (bw <= 0 || bh <= 0)
++        {
++          continue;
++        }
++
++      /* Green for a person, amber for anything else. Class 0 is person in the
++       * COCO ordering the model was trained on, and it is the only class this
++       * is actually looking for, so it gets the colour that reads as a hit.
++       */
++
++      colour = (b->cls == 0) ? 0xff00ff00u : 0xffffaa00u;
++
++      fb_hline(fb, bx, by, bw, colour);
++      fb_hline(fb, bx, by + bh - 2, bw, colour);
++      fb_vline(fb, bx, by, bh, colour);
++      fb_vline(fb, bx + bw - 2, by, bh, colour);
++
++      /* Confidence, as a bar just above the box. Clamped into the frame so a
++       * detection at the top edge still shows one.
++       */
++
++      bar = (int)((uint32_t)bw * b->score / 100u);
++      if (bar > 0)
++        {
++          int bary = (by > (int)y0 + 4) ? by - 4 : by + bh;
++
++          fb_hline(fb, bx, bary, bar, colour);
++        }
++    }
++}
++
++static void fb_blit(struct ampcam_fb_s *fb, const uint8_t *frame,
++                    uint32_t w, uint32_t h, uint32_t x0, uint32_t y0)
++{
++  uint32_t srcrow = w * 4;
++  uint32_t row;
++
++  for (row = 0; row < h; row++)
++    {
++      memcpy(fb->mem + (size_t)(y0 + row) * fb->stride + (size_t)x0 * 4,
++             frame + (size_t)row * srcrow, srcrow);
++    }
++}
++
++/****************************************************************************
++ * Name: fb_publish
++ *
++ * Description:
++ *   Hand the rows just written to the panel.
++ *
++ *   Separate from fb_blit because the boxes have to be drawn into the same
++ *   buffer between the two. Publishing the image and then publishing the boxes
++ *   would put a frame on screen without its detections and then the detections
++ *   a moment later, which reads as flicker on every box.
++ *
++ ****************************************************************************/
++
++static void fb_publish(struct ampcam_fb_s *fb, uint32_t w, uint32_t h,
++                       uint32_t x0, uint32_t y0)
++{
++  struct fb_area_s area;
++
++  area.x = (fb_coord_t)x0;
++  area.y = (fb_coord_t)y0;
++  area.w = (fb_coord_t)w;
++  area.h = (fb_coord_t)h;
++
++  if (ioctl(fb->fd, FBIO_UPDATE, (unsigned long)&area) < 0)
++    {
++      /* Reported once per occurrence rather than counted and summarised,
++       * because an update that fails means nothing reaches the panel at all -
++       * there is no partially working state to measure.
++       */
++
++      fprintf(stderr, "ampcam: FBIO_UPDATE: %s\n", strerror(errno));
++    }
++}
++
++/****************************************************************************
++ * Name: report
++ ****************************************************************************/
++
++static void report(int camfd, uint32_t frames, uint64_t elapsed_ms)
++{
++  struct ampcam_stats_s st;
++
++  if (ioctl(camfd, AMPCAMIOC_GETSTATS, (unsigned long)&st) < 0)
++    {
++      /* Said out loud rather than returned from quietly. The first version
++       * returned here without a word, which meant a failing ioctl and a
++       * blocked read() produced exactly the same thing on the console -
++       * nothing at all - and the counters that would have named the problem
++       * were the counters being suppressed.
++       */
++
++      fprintf(stderr, "ampcam: GETSTATS: %s\n", strerror(errno));
++      return;
++    }
++
++  printf("ampcam: %" PRIu32 " frames in %" PRIu64 " ms (%" PRIu32
++         ".%01" PRIu32 " fps) | notify %" PRIu32 " copied %" PRIu32
++         " dropped %" PRIu32 " torn %" PRIu32 " bad %" PRIu32 "\n",
++         frames, elapsed_ms,
++         elapsed_ms ? (uint32_t)(frames * 1000 / elapsed_ms) : 0,
++         elapsed_ms ? (uint32_t)((frames * 10000 / elapsed_ms) % 10) : 0,
++         st.notify, st.copied, st.dropped, st.torn, st.bad);
++
++  /* On its own line, because the two transports run at different rates and
++   * folding them together would make a detector at ten a second look like a
++   * frame path missing two thirds of its work.
++   *
++   * Printed unconditionally, including when everything is zero. The first
++   * version of this collected these four counters and then never displayed
++   * them, so a working transport and an absent one looked identical on the
++   * console - the same failure as the report that said nothing when its ioctl
++   * failed, one level up.
++   */
++
++  printf("ampcam: detect | notify %" PRIu32 " read %" PRIu32
++         " torn %" PRIu32 " bad %" PRIu32 "\n",
++         st.det_notify, st.det_read, st.det_torn, st.det_bad);
++}
++
++/****************************************************************************
++ * Name: usage
++ ****************************************************************************/
++
++static void usage(const char *prog)
++{
++  fprintf(stderr,
++          "Usage: %s [-s] [-n frames] [-i seconds] [-c dev] [-f dev]\n"
++          "  -s          statistics only, do not touch the framebuffer\n"
++          "  -n frames   stop after this many frames (0 = forever)\n"
++          "  -i seconds  reporting interval, default 2\n"
++          "  -c dev      camera device, default /dev/amcam0\n"
++          "  -f dev      framebuffer, default /dev/fb0\n",
++          prog);
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++int main(int argc, FAR char *argv[])
++{
++  const char *camdev = "/dev/amcam0";
++  const char *fbdev = "/dev/fb0";
++  struct ampcam_geom_s geom;
++  struct ampcam_detect_s det;
++  struct ampcam_fb_s fb;
++  bool det_present = false;
++  bool det_complained = false;
++  uint8_t *frame = NULL;
++  size_t framesize;
++  uint32_t limit = 0;
++  uint32_t interval = 2;
++  uint32_t frames = 0;
++  uint32_t x0 = 0;
++  uint32_t y0 = 0;
++  uint64_t start;
++  uint64_t last;
++  bool stats_only = false;
++  int camfd = -1;
++  int ret = EXIT_FAILURE;
++  int opt;
++
++  memset(&fb, 0, sizeof(fb));
++  memset(&det, 0, sizeof(det));
++  fb.fd = -1;
++  det.count = -1;
++
++  while ((opt = getopt(argc, argv, "sn:i:c:f:h")) != -1)
++    {
++      switch (opt)
++        {
++          case 's':
++            stats_only = true;
++            break;
++
++          case 'n':
++            limit = (uint32_t)strtoul(optarg, NULL, 0);
++            break;
++
++          case 'i':
++            interval = (uint32_t)strtoul(optarg, NULL, 0);
++            if (interval == 0)
++              {
++                interval = 1;
++              }
++            break;
++
++          case 'c':
++            camdev = optarg;
++            break;
++
++          case 'f':
++            fbdev = optarg;
++            break;
++
++          default:
++            usage(argv[0]);
++            return EXIT_FAILURE;
++        }
++    }
++
++  camfd = open(camdev, O_RDONLY);
++  if (camfd < 0)
++    {
++      fprintf(stderr, "ampcam: %s: %s\n", camdev, strerror(errno));
++      return EXIT_FAILURE;
++    }
++
++  if (wait_for_stream(camfd, &geom, 30) < 0)
++    {
++      goto out;
++    }
++
++  framesize = (size_t)geom.width * geom.height * geom.bpp;
++  frame = malloc(framesize);
++  if (frame == NULL)
++    {
++      fprintf(stderr, "ampcam: cannot allocate %zu bytes\n", framesize);
++      goto out;
++    }
++
++  if (!stats_only)
++    {
++      if (fb_setup(&fb, fbdev) < 0)
++        {
++          goto out;
++        }
++
++      if (geom.width > fb.width || geom.height > fb.height)
++        {
++          fprintf(stderr,
++                  "ampcam: frame %" PRIu32 "x%" PRIu32 " does not fit the"
++                  " %" PRIu32 "x%" PRIu32 " panel - reduce the capture size on"
++                  " the Linux side\n",
++                  geom.width, geom.height, fb.width, fb.height);
++          goto out;
++        }
++
++      x0 = (fb.width - geom.width) / 2;
++      y0 = (fb.height - geom.height) / 2;
++
++      /* Clear once so the border around the image is black rather than whatever
++       * the previous occupant of the buffer left there. Only the first buffer,
++       * which is the one being drawn into.
++       */
++
++      memset(fb.mem, 0, (size_t)fb.stride * fb.height);
++
++      printf("ampcam: drawing at %" PRIu32 ",%" PRIu32 "\n", x0, y0);
++    }
++
++  /* A baseline before the first read, and this is the single most useful line
++   * this program prints.
++   *
++   * read() blocks until there is a frame, so if the transport is failing in a
++   * way that never produces one, everything after this point is silent and the
++   * counters that say why are unreachable. Printing them once up front means
++   * "notify climbing, copied zero, torn climbing" is on the console before
++   * anything can block - which is the difference between reading the answer and
++   * deducing it.
++   */
++
++  printf("ampcam: transport counters before the first read:\n");
++  report(camfd, 0, 0);
++
++  start = now_ms();
++  last = start;
++
++  for (; ; )
++    {
++      ssize_t n = read(camfd, (char *)frame, framesize);
++
++      if (n < 0)
++        {
++          if (errno == EINTR)
++            {
++              continue;
++            }
++
++          if (errno == ETIMEDOUT)
++            {
++              /* No clean frame for a couple of seconds. Not fatal - the
++               * producer may simply be idle - but the counters say which it is,
++               * so print them and carry on rather than either exiting or
++               * sitting here quietly.
++               */
++
++              printf("ampcam: no frame for 2s -");
++              report(camfd, frames, now_ms() - start);
++              printf("ampcam: if torn is climbing, this side cannot copy a"
++                     " frame faster than Linux replaces it\n");
++              continue;
++            }
++
++          fprintf(stderr, "ampcam: read: %s\n", strerror(errno));
++          goto out;
++        }
++
++      if ((size_t)n != framesize)
++        {
++          /* A short read means the geometry moved under us, which happens if
++           * the Linux side restarts capture at a different size. Stopping with
++           * the numbers is more useful than silently drawing a stretched image.
++           */
++
++          fprintf(stderr,
++                  "ampcam: read %zd bytes, expected %zu - capture geometry"
++                  " changed, restart this program\n", n, framesize);
++          goto out;
++        }
++
++      frames++;
++
++      /* Detections fetched every frame rather than only when a notification
++       * arrived, and the reason is the rate difference. The producer publishes
++       * about ten sets a second while this draws thirty frames; if the boxes
++       * were only drawn on the frames where a set happened to be new, two
++       * frames in three would show none and the result would flicker rather
++       * than lag. Asking every frame and redrawing whatever is current makes
++       * the boxes hold still between updates, which is what "the boxes are
++       * slightly behind" is supposed to look like.
++       */
++
++      if (ioctl(camfd, AMPCAMIOC_GETDET, (unsigned long)&det) < 0)
++        {
++          if (!det_complained)
++            {
++              fprintf(stderr, "ampcam: GETDET: %s - boxes will not be"
++                      " drawn\n", strerror(errno));
++              det_complained = true;
++            }
++
++          det.count = -1;
++        }
++
++      if (!stats_only)
++        {
++          fb_blit(&fb, frame, geom.width, geom.height, x0, y0);
++
++          if (det.count > 0)
++            {
++              fb_draw_boxes(&fb, &det, geom.width, geom.height, x0, y0);
++            }
++
++          fb_publish(&fb, geom.width, geom.height, x0, y0);
++        }
++
++      /* Said once when a detector appears and once when it goes away, because
++       * the interesting transitions are exactly those two and printing per
++       * frame would bury them.
++       */
++
++      if ((det.count >= 0) != det_present)
++        {
++          det_present = (det.count >= 0);
++          printf("ampcam: detector %s\n",
++                 det_present ? "present" : "gone");
++        }
++
++      if (now_ms() - last >= (uint64_t)interval * 1000)
++        {
++          report(camfd, frames, now_ms() - start);
++          last = now_ms();
++        }
++
++      if (limit != 0 && frames >= limit)
++        {
++          break;
++        }
++    }
++
++  report(camfd, frames, now_ms() - start);
++  ret = EXIT_SUCCESS;
++
++out:
++  if (fb.mem != NULL && fb.mem != MAP_FAILED)
++    {
++      munmap(fb.mem, fb.len);
++    }
++
++  if (fb.fd >= 0)
++    {
++      close(fb.fd);
++    }
++
++  free(frame);
++
++  if (camfd >= 0)
++    {
++      close(camfd);
++    }
++
++  return ret;
++}
+diff --git a/examples/ampui/Kconfig b/examples/ampui/Kconfig
+new file mode 100644
+index 000000000..bf113b55d
+--- /dev/null
++++ b/examples/ampui/Kconfig
+@@ -0,0 +1,42 @@
++#
++# For a description of the syntax of this configuration file,
++# see the file kconfig-language.txt in the NuttX tools repository.
++#
++
++config EXAMPLES_AMPUI
++	tristate "AMP camera UI (LVGL home screen + camera view)"
++	default n
++	depends on GRAPHICS_LVGL && LV_USE_NUTTX && LV_USE_CANVAS
++	---help---
++		A home screen with a camera icon and a button, and a camera screen
++		showing the frames the Linux side publishes in the AMP shared
++		carveout with the detections drawn over them. The camera screen has
++		a back button.
++
++		Replaces the ampcam viewer rather than complementing it: ampcam
++		writes /dev/fb0 directly while LVGL renders into the same buffers,
++		with no ownership protocol between them, so only one of the two can
++		run at a time.
++
++		Needs a board that provides /dev/amcam0 and /dev/fb0 - currently the
++		RK3588 EVB7 AMP configuration.
++
++if EXAMPLES_AMPUI
++
++config EXAMPLES_AMPUI_PROGNAME
++	string "Program name"
++	default "ampui"
++
++config EXAMPLES_AMPUI_PRIORITY
++	int "Task priority"
++	default 100
++
++config EXAMPLES_AMPUI_STACKSIZE
++	int "Stack size"
++	default 16384
++	---help---
++		Larger than the default task stack because LVGL's rendering runs on
++		this task. The detection set is kept off the stack deliberately, but
++		the toolkit's own draw path is not this application's to size.
++
++endif
+diff --git a/examples/ampui/Make.defs b/examples/ampui/Make.defs
+new file mode 100644
+index 000000000..aa984d9d6
+--- /dev/null
++++ b/examples/ampui/Make.defs
+@@ -0,0 +1,25 @@
++############################################################################
++# apps/examples/ampui/Make.defs
++#
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.  The
++# ASF licenses this file to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance with the
++# License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
++# License for the specific language governing permissions and limitations
++# under the License.
++#
++############################################################################
++
++ifneq ($(CONFIG_EXAMPLES_AMPUI),)
++CONFIGURED_APPS += $(APPDIR)/examples/ampui
++endif
+diff --git a/examples/ampui/Makefile b/examples/ampui/Makefile
+new file mode 100644
+index 000000000..1627b2568
+--- /dev/null
++++ b/examples/ampui/Makefile
+@@ -0,0 +1,34 @@
++############################################################################
++# apps/examples/ampui/Makefile
++#
++# SPDX-License-Identifier: Apache-2.0
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.  The
++# ASF licenses this file to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance with the
++# License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
++# License for the specific language governing permissions and limitations
++# under the License.
++#
++############################################################################
++
++include $(APPDIR)/Make.defs
++
++# AMP camera UI: LVGL home screen and camera view
++
++PROGNAME  = $(CONFIG_EXAMPLES_AMPUI_PROGNAME)
++PRIORITY  = $(CONFIG_EXAMPLES_AMPUI_PRIORITY)
++STACKSIZE = $(CONFIG_EXAMPLES_AMPUI_STACKSIZE)
++MODULE    = $(CONFIG_EXAMPLES_AMPUI)
++
++MAINSRC = ampui_main.c
++
++include $(APPDIR)/Application.mk
+diff --git a/examples/ampui/ampui_main.c b/examples/ampui/ampui_main.c
+new file mode 100644
+index 000000000..d660df104
+--- /dev/null
++++ b/examples/ampui/ampui_main.c
+@@ -0,0 +1,832 @@
++/****************************************************************************
++ * apps/examples/ampui/ampui_main.c
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.  The
++ * ASF licenses this file to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance with the
++ * License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
++ * License for the specific language governing permissions and limitations
++ * under the License.
++ *
++ ****************************************************************************/
++
++/* A home screen and a camera screen, on the panel this core drives directly.
++ *
++ * Why this replaces ampcam rather than sitting beside it
++ * ----------------------------------------------------------------------------
++ * ampcam mmaps /dev/fb0 and writes the first of its two buffers, publishing with
++ * FBIO_UPDATE only. LVGL's fbdev backend mmaps the same region, renders into
++ * whichever buffer is free and follows up with FBIOPAN_DISPLAY. There is no
++ * ownership protocol between them - no lock, no shared state - so running both
++ * means two writers on the same pixels and neither picture survives. The camera
++ * view therefore has to live inside the LVGL application, which is what this is.
++ *
++ * Nothing is lost by moving it: the frame still arrives as one copy out of the
++ * shared carveout, and the boxes are still drawn with direct stores. What is
++ * gained is a real back button, hit-tested by the toolkit, instead of a
++ * hand-drawn rectangle and hand-written coordinate comparisons.
++ *
++ * Why the canvas is the size of the frame and not the size of the screen
++ * ----------------------------------------------------------------------------
++ * read() on /dev/amcam0 returns whole rows, packed, stride = width * 4. With
++ * LV_DRAW_BUF_STRIDE_ALIGN at 1, lv_canvas_set_buffer() computes exactly that
++ * same stride, so the frame can be read straight into the canvas buffer. No
++ * intermediate buffer, no per-row loop, and the copy count is the same as
++ * ampcam's.
++ *
++ * Sizing the canvas to the frame instead of the panel also deletes the centring
++ * arithmetic ampcam needed. A 540x960 frame fills the screen and a 512x288 one
++ * is centred with a black border, and the difference is lv_obj_center() rather
++ * than an x0/y0 offset threaded through the blit and every box. Boxes are then
++ * in the canvas's own coordinates, which is the space the producer already
++ * publishes them in.
++ *
++ * Why the frames are pumped from a timer and not read in a loop
++ * ----------------------------------------------------------------------------
++ * /dev/amcam0 has no poll method, so there is no way to wait on it together with
++ * anything else. A blocking read holds still for up to two seconds when the
++ * producer is idle, and doing that from the LVGL thread would freeze the button
++ * that gets you out of this screen. O_NONBLOCK turns "no new frame" into -EAGAIN,
++ * which is a timer tick with nothing to do.
++ *
++ * Why there is a heartbeat
++ * ----------------------------------------------------------------------------
++ * Not decoration. The window this core scans out of is Esmart3 on vp3, and it
++ * stays in vp3's plane mask, so a Linux modeset walks it and switches it off -
++ * see evb7_amp_vop.c. Every register is rewritten on each flip, so the next
++ * frame this core publishes brings the window back. That works while something
++ * is being redrawn, and the home screen is static: with nothing invalidated
++ * there is no flush, no pan, no flip, and the panel would stay dark from the
++ * moment Linux starts its side until the first touch.
++ *
++ * A once-a-second invalidate of one small object is enough, because any flush
++ * reaches evb7_amp_vop_flip(). It is drawn as a visible dot rather than an
++ * invisible timer so that a stalled UI looks stalled instead of looking like a
++ * display fault.
++ *
++ * Why the labels are in English
++ * ----------------------------------------------------------------------------
++ * The only fonts built in are Montserrat 20 and 24, which are Latin. Chinese
++ * text would render as empty boxes, and shipping a CJK font is several hundred
++ * kilobytes of glyph data in an image that is currently under a megabyte. The
++ * camera icon is drawn from primitives for the same reason - there is no camera
++ * glyph in the built-in symbol set.
++ */
++
++/****************************************************************************
++ * Included Files
++ ****************************************************************************/
++
++#include <nuttx/config.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include <arch/board/board.h>
++
++#include <lvgl/lvgl.h>
++
++/****************************************************************************
++ * Pre-processor Definitions
++ ****************************************************************************/
++
++#define AMPUI_CAM_DEV       "/dev/amcam0"
++
++/* Frame pump interval. Faster than the 30fps the producer manages, so a frame
++ * is picked up in the tick after it appears rather than up to a whole tick
++ * later. A tick with no frame costs one failed read.
++ */
++
++#define AMPUI_FRAME_MS      16
++
++/* Heartbeat, and the interval the on-screen counters are refreshed at. One
++ * second is short enough that a modeset cannot leave the panel dark for long,
++ * and long enough that the redraw it forces is not worth measuring.
++ */
++
++#define AMPUI_BEAT_MS       1000
++
++/* Green for a person, amber for anything else. Class 0 is person in the COCO
++ * ordering the model was trained on, and it is the class this is looking for,
++ * so it gets the colour that reads as a hit. The same two values ampcam used,
++ * so a screenshot of either means the same thing.
++ */
++
++#define AMPUI_BOX_PERSON    0xff00ff00u
++#define AMPUI_BOX_OTHER     0xffffaa00u
++
++#define AMPUI_BG            0x101418
++#define AMPUI_ACCENT        0x2f7fe0
++
++/****************************************************************************
++ * Private Types
++ ****************************************************************************/
++
++struct ampui_s
++{
++  lv_obj_t   *home;
++  lv_obj_t   *cam;
++  lv_obj_t   *canvas;
++  lv_obj_t   *cam_status;
++  lv_obj_t   *home_status;
++  lv_obj_t   *beat;
++
++  lv_timer_t *frame_timer;
++  lv_timer_t *beat_timer;
++
++  int         camfd;
++
++  /* Canvas backing store, frame-sized. Reallocated if the producer changes
++   * geometry, which happens when the Linux side is restarted with a different
++   * rotation.
++   */
++
++  uint8_t    *buf;
++  uint32_t    buf_w;
++  uint32_t    buf_h;
++
++  uint32_t    frames;
++  uint32_t    last_frames;
++  uint32_t    boxes;
++  bool        beat_on;
++  bool        on_cam;
++
++  /* Off the stack: 64 boxes plus a header is most of a kilobyte, and this is
++   * filled in from a timer callback running on the main task's stack.
++   */
++
++  struct ampcam_detect_s det;
++};
++
++/****************************************************************************
++ * Private Data
++ ****************************************************************************/
++
++static struct ampui_s g_ui;
++
++/****************************************************************************
++ * Private Functions
++ ****************************************************************************/
++
++/****************************************************************************
++ * Name: ampui_camera_open
++ *
++ * Description:
++ *   Open the frame device if it is not open already.
++ *
++ *   Retried rather than opened once at startup, because /dev/amcam0 is
++ *   registered when the shared-memory endpoint is set up and this application
++ *   may well be running before Linux has finished coming up. A failure here is
++ *   a state to display, not an error to exit on.
++ *
++ ****************************************************************************/
++
++static bool ampui_camera_open(struct ampui_s *ui)
++{
++  if (ui->camfd >= 0)
++    {
++      return true;
++    }
++
++  ui->camfd = open(AMPUI_CAM_DEV, O_RDONLY | O_NONBLOCK);
++  return ui->camfd >= 0;
++}
++
++/****************************************************************************
++ * Name: ampui_canvas_fit
++ *
++ * Description:
++ *   Make the canvas match the producer's geometry, allocating on the first
++ *   frame and reallocating if it ever changes.
++ *
++ *   Returns false when the buffer could not be allocated, in which case the
++ *   caller must not read - the canvas still points at the old buffer, or at
++ *   none.
++ *
++ ****************************************************************************/
++
++static bool ampui_canvas_fit(struct ampui_s *ui, uint32_t w, uint32_t h)
++{
++  uint8_t *buf;
++
++  if (w == 0 || h == 0)
++    {
++      return false;
++    }
++
++  if (ui->buf != NULL && ui->buf_w == w && ui->buf_h == h)
++    {
++      return true;
++    }
++
++  buf = malloc((size_t)w * h * 4);
++  if (buf == NULL)
++    {
++      return false;
++    }
++
++  /* Black, so the first partial frame does not appear over whatever the heap
++   * happened to contain.
++   */
++
++  memset(buf, 0, (size_t)w * h * 4);
++
++  /* The canvas is pointed at the new buffer before the old one is released,
++   * so LVGL never holds a pointer into freed memory even briefly.
++   */
++
++  lv_canvas_set_buffer(ui->canvas, buf, (int32_t)w, (int32_t)h,
++                       LV_COLOR_FORMAT_XRGB8888);
++  lv_obj_center(ui->canvas);
++
++  free(ui->buf);
++  ui->buf   = buf;
++  ui->buf_w = w;
++  ui->buf_h = h;
++
++  printf("ampui: canvas is %" PRIu32 "x%" PRIu32 ", %s\n", w, h,
++         (w == (uint32_t)LV_HOR_RES && h == (uint32_t)LV_VER_RES) ?
++         "full screen" : "centred");
++  return true;
++}
++
++/****************************************************************************
++ * Name: ampui_hline / ampui_vline
++ *
++ * Description:
++ *   Two-pixel lines straight into the canvas buffer, clipped to it.
++ *
++ *   Written as stores rather than as LVGL objects because there can be 64 boxes
++ *   in a set and a set every frame: creating and deleting a few hundred objects
++ *   a second to draw eight rectangles' worth of pixels would cost more than the
++ *   pixels do. The buffer is ours, XRGB8888 and packed, so a store is well
++ *   defined here.
++ *
++ *   Clipped rather than trusted. The coordinates come from a model running on
++ *   the other core; a box a pixel outside the frame is a plausible rounding
++ *   result, and writing it unclipped is a stray store past the buffer.
++ *
++ ****************************************************************************/
++
++static void ampui_hline(struct ampui_s *ui, int x, int y, int len,
++                        uint32_t colour)
++{
++  int t;
++
++  for (t = 0; t < 2; t++, y++)
++    {
++      uint32_t *row;
++      int i;
++
++      if (y < 0 || y >= (int)ui->buf_h)
++        {
++          continue;
++        }
++
++      row = (uint32_t *)(ui->buf + (size_t)y * ui->buf_w * 4);
++
++      for (i = 0; i < len; i++)
++        {
++          int px = x + i;
++
++          if (px >= 0 && px < (int)ui->buf_w)
++            {
++              row[px] = colour;
++            }
++        }
++    }
++}
++
++static void ampui_vline(struct ampui_s *ui, int x, int y, int len,
++                        uint32_t colour)
++{
++  int i;
++
++  for (i = 0; i < len; i++)
++    {
++      int py = y + i;
++      uint32_t *row;
++      int t;
++
++      if (py < 0 || py >= (int)ui->buf_h)
++        {
++          continue;
++        }
++
++      row = (uint32_t *)(ui->buf + (size_t)py * ui->buf_w * 4);
++
++      for (t = 0; t < 2; t++)
++        {
++          int px = x + t;
++
++          if (px >= 0 && px < (int)ui->buf_w)
++            {
++              row[px] = colour;
++            }
++        }
++    }
++}
++
++/****************************************************************************
++ * Name: ampui_draw_boxes
++ *
++ * Description:
++ *   Outline every detection over the frame just read, plus a bar whose length
++ *   is the confidence.
++ *
++ *   Scaled from the detector's coordinate space rather than assumed equal to
++ *   the frame's. They are the same today - the producer publishes boxes in the
++ *   published frame's space - but the descriptor carries its own width and
++ *   height precisely so this does not become an assumption that breaks quietly
++ *   the first time either resolution moves.
++ *
++ ****************************************************************************/
++
++static void ampui_draw_boxes(struct ampui_s *ui)
++{
++  const struct ampcam_detect_s *det = &ui->det;
++  int i;
++
++  if (det->count <= 0 || det->width == 0 || det->height == 0)
++    {
++      return;
++    }
++
++  for (i = 0; i < det->count && i < AMPCAM_MAXBOX; i++)
++    {
++      const struct ampcam_box_s *b = &det->box[i];
++      uint32_t colour;
++      int bx;
++      int by;
++      int bw;
++      int bh;
++      int bar;
++
++      bx = (int)((uint64_t)b->x * ui->buf_w / det->width);
++      by = (int)((uint64_t)b->y * ui->buf_h / det->height);
++      bw = (int)((uint64_t)b->w * ui->buf_w / det->width);
++      bh = (int)((uint64_t)b->h * ui->buf_h / det->height);
++
++      if (bw <= 0 || bh <= 0)
++        {
++          continue;
++        }
++
++      colour = (b->cls == 0) ? AMPUI_BOX_PERSON : AMPUI_BOX_OTHER;
++
++      ampui_hline(ui, bx, by, bw, colour);
++      ampui_hline(ui, bx, by + bh - 2, bw, colour);
++      ampui_vline(ui, bx, by, bh, colour);
++      ampui_vline(ui, bx + bw - 2, by, bh, colour);
++
++      /* Confidence as a bar just above the box, moved below it when the box is
++       * against the top edge so a detection there still shows one.
++       */
++
++      bar = (int)((uint32_t)bw * b->score / 100u);
++      if (bar > 0)
++        {
++          ampui_hline(ui, bx, by > 4 ? by - 4 : by + bh, bar, colour);
++        }
++    }
++}
++
++/****************************************************************************
++ * Name: ampui_frame_cb
++ *
++ * Description:
++ *   One tick of the camera screen: take a frame if there is one, put the
++ *   current boxes on it, and hand it to the toolkit.
++ *
++ ****************************************************************************/
++
++static void ampui_frame_cb(lv_timer_t *timer)
++{
++  struct ampui_s *ui = lv_timer_get_user_data(timer);
++  struct ampcam_geom_s geom;
++  ssize_t n;
++
++  if (!ampui_camera_open(ui))
++    {
++      return;
++    }
++
++  /* Geometry first, because the buffer has to be the right size before the
++   * read rather than after it. The ioctl is a few loads from the descriptor.
++   */
++
++  if (ioctl(ui->camfd, AMPCAMIOC_GETGEOM, (unsigned long)&geom) < 0)
++    {
++      return;
++    }
++
++  if (!ampui_canvas_fit(ui, geom.width, geom.height))
++    {
++      return;
++    }
++
++  n = read(ui->camfd, (char *)ui->buf, (size_t)ui->buf_w * ui->buf_h * 4);
++  if (n <= 0)
++    {
++      /* -EAGAIN is the normal case: the producer has not published since the
++       * last tick. Everything else is left alone deliberately - the frame
++       * already on screen stays there, which is what a dropped frame should
++       * look like.
++       */
++
++      return;
++    }
++
++  ui->frames++;
++
++  /* Detections every frame rather than only when a new set arrives. The
++   * producer publishes about ten a second against thirty frames here; drawing
++   * them only on the frames where a set happened to be new would leave two
++   * frames in three without boxes, which reads as flicker rather than as lag.
++   */
++
++  if (ioctl(ui->camfd, AMPCAMIOC_GETDET, (unsigned long)&ui->det) < 0)
++    {
++      ui->det.count = -1;
++    }
++
++  if (ui->det.count > 0)
++    {
++      ui->boxes = (uint32_t)ui->det.count;
++      ampui_draw_boxes(ui);
++    }
++  else
++    {
++      ui->boxes = 0;
++    }
++
++  lv_obj_invalidate(ui->canvas);
++}
++
++/****************************************************************************
++ * Name: ampui_beat_cb
++ *
++ * Description:
++ *   The once-a-second redraw that keeps the window programmed, and the counters
++ *   that make it visible.
++ *
++ *   See the note at the top of this file: without something invalidating on a
++ *   static screen there is no flip, and without a flip a Linux modeset leaves
++ *   the panel dark.
++ *
++ ****************************************************************************/
++
++static void ampui_beat_cb(lv_timer_t *timer)
++{
++  struct ampui_s *ui = lv_timer_get_user_data(timer);
++  char text[64];
++
++  ui->beat_on = !ui->beat_on;
++  lv_obj_set_style_bg_opa(ui->beat, ui->beat_on ? LV_OPA_COVER : LV_OPA_20,
++                          LV_PART_MAIN);
++
++  if (ui->on_cam)
++    {
++      uint32_t fps = ui->frames - ui->last_frames;
++
++      ui->last_frames = ui->frames;
++
++      snprintf(text, sizeof(text), "%" PRIu32 " fps   %" PRIu32 " box%s",
++               fps, ui->boxes, ui->boxes == 1 ? "" : "es");
++      lv_label_set_text(ui->cam_status, text);
++    }
++  else
++    {
++      /* The home screen says whether there is anything to show before the
++       * button is pressed, because "the camera page is black" and "the other
++       * core is not publishing" are the same picture and different problems.
++       */
++
++      struct ampcam_geom_s geom;
++
++      if (!ampui_camera_open(ui))
++        {
++          lv_label_set_text(ui->home_status, "camera device not ready");
++        }
++      else if (ioctl(ui->camfd, AMPCAMIOC_GETGEOM,
++                     (unsigned long)&geom) < 0 || geom.width == 0)
++        {
++          lv_label_set_text(ui->home_status, "waiting for the host to stream");
++        }
++      else
++        {
++          snprintf(text, sizeof(text), "stream ready  %" PRIu32 "x%" PRIu32,
++                   geom.width, geom.height);
++          lv_label_set_text(ui->home_status, text);
++        }
++    }
++}
++
++/****************************************************************************
++ * Name: ampui_show_cam / ampui_show_home
++ *
++ * Description:
++ *   Switch screens, and start or stop the frame pump with them.
++ *
++ *   Paused rather than left running, because a timer reading the camera while
++ *   the home screen is up would copy two megabytes thirty times a second into a
++ *   canvas nothing is drawing.
++ *
++ ****************************************************************************/
++
++static void ampui_show_cam(lv_event_t *e)
++{
++  struct ampui_s *ui = lv_event_get_user_data(e);
++
++  ui->on_cam      = true;
++  ui->last_frames = ui->frames;
++
++  lv_screen_load(ui->cam);
++  lv_timer_resume(ui->frame_timer);
++}
++
++static void ampui_show_home(lv_event_t *e)
++{
++  struct ampui_s *ui = lv_event_get_user_data(e);
++
++  ui->on_cam = false;
++
++  lv_timer_pause(ui->frame_timer);
++  lv_screen_load(ui->home);
++}
++
++/****************************************************************************
++ * Name: ampui_icon
++ *
++ * Description:
++ *   A camera, from four rectangles and two circles.
++ *
++ *   Drawn rather than loaded: there is no camera glyph in the built-in symbol
++ *   set, and an image asset would be a generated C array to keep in step with
++ *   nothing. Six styled objects are cheaper to read than that, and they scale
++ *   with the numbers here rather than with a bitmap.
++ *
++ ****************************************************************************/
++
++static void ampui_icon(lv_obj_t *parent)
++{
++  lv_obj_t *body;
++  lv_obj_t *bump;
++  lv_obj_t *ring;
++  lv_obj_t *glass;
++  lv_obj_t *flash;
++
++  /* Viewfinder bump first, so the body's rounded corner overlaps it rather
++   * than the other way round.
++   */
++
++  bump = lv_obj_create(parent);
++  lv_obj_remove_flag(bump, LV_OBJ_FLAG_SCROLLABLE);
++  lv_obj_set_size(bump, 52, 22);
++  lv_obj_align(bump, LV_ALIGN_TOP_LEFT, 26, 0);
++  lv_obj_set_style_radius(bump, 6, LV_PART_MAIN);
++  lv_obj_set_style_bg_color(bump, lv_color_hex(0x3a4450), LV_PART_MAIN);
++  lv_obj_set_style_border_width(bump, 0, LV_PART_MAIN);
++
++  body = lv_obj_create(parent);
++  lv_obj_remove_flag(body, LV_OBJ_FLAG_SCROLLABLE);
++  lv_obj_set_size(body, 168, 116);
++  lv_obj_align(body, LV_ALIGN_BOTTOM_MID, 0, 0);
++  lv_obj_set_style_radius(body, 18, LV_PART_MAIN);
++  lv_obj_set_style_bg_color(body, lv_color_hex(0x2b333d), LV_PART_MAIN);
++  lv_obj_set_style_border_width(body, 0, LV_PART_MAIN);
++
++  ring = lv_obj_create(body);
++  lv_obj_remove_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
++  lv_obj_set_size(ring, 74, 74);
++  lv_obj_center(ring);
++  lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, LV_PART_MAIN);
++  lv_obj_set_style_bg_color(ring, lv_color_hex(0x151a20), LV_PART_MAIN);
++  lv_obj_set_style_border_width(ring, 3, LV_PART_MAIN);
++  lv_obj_set_style_border_color(ring, lv_color_hex(0x8fa2b6), LV_PART_MAIN);
++
++  glass = lv_obj_create(ring);
++  lv_obj_remove_flag(glass, LV_OBJ_FLAG_SCROLLABLE);
++  lv_obj_set_size(glass, 34, 34);
++  lv_obj_center(glass);
++  lv_obj_set_style_radius(glass, LV_RADIUS_CIRCLE, LV_PART_MAIN);
++  lv_obj_set_style_bg_color(glass, lv_color_hex(AMPUI_ACCENT), LV_PART_MAIN);
++  lv_obj_set_style_border_width(glass, 0, LV_PART_MAIN);
++
++  flash = lv_obj_create(body);
++  lv_obj_remove_flag(flash, LV_OBJ_FLAG_SCROLLABLE);
++  lv_obj_set_size(flash, 14, 14);
++  lv_obj_align(flash, LV_ALIGN_TOP_RIGHT, -14, 14);
++  lv_obj_set_style_radius(flash, LV_RADIUS_CIRCLE, LV_PART_MAIN);
++  lv_obj_set_style_bg_color(flash, lv_color_hex(0xf0c14b), LV_PART_MAIN);
++  lv_obj_set_style_border_width(flash, 0, LV_PART_MAIN);
++}
++
++/****************************************************************************
++ * Name: ampui_build_home
++ ****************************************************************************/
++
++static void ampui_build_home(struct ampui_s *ui)
++{
++  lv_obj_t *icon;
++  lv_obj_t *title;
++  lv_obj_t *btn;
++  lv_obj_t *label;
++
++  ui->home = lv_obj_create(NULL);
++  lv_obj_remove_flag(ui->home, LV_OBJ_FLAG_SCROLLABLE);
++  lv_obj_set_style_bg_color(ui->home, lv_color_hex(AMPUI_BG), LV_PART_MAIN);
++
++  title = lv_label_create(ui->home);
++  lv_label_set_text(title, "AMP Vision");
++  lv_obj_set_style_text_font(title, &lv_font_montserrat_24, LV_PART_MAIN);
++  lv_obj_set_style_text_color(title, lv_color_hex(0xf0f4f8), LV_PART_MAIN);
++  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 60);
++
++  /* A plain container for the icon, so the pieces inside it can be positioned
++   * against each other rather than against the screen.
++   */
++
++  icon = lv_obj_create(ui->home);
++  lv_obj_remove_flag(icon, LV_OBJ_FLAG_SCROLLABLE);
++  lv_obj_set_size(icon, 180, 140);
++  lv_obj_align(icon, LV_ALIGN_CENTER, 0, -80);
++  lv_obj_set_style_bg_opa(icon, LV_OPA_TRANSP, LV_PART_MAIN);
++  lv_obj_set_style_border_width(icon, 0, LV_PART_MAIN);
++  lv_obj_set_style_pad_all(icon, 0, LV_PART_MAIN);
++  ampui_icon(icon);
++
++  btn = lv_button_create(ui->home);
++  lv_obj_set_size(btn, 300, 76);
++  lv_obj_align(btn, LV_ALIGN_CENTER, 0, 90);
++  lv_obj_set_style_radius(btn, 38, LV_PART_MAIN);
++  lv_obj_set_style_bg_color(btn, lv_color_hex(AMPUI_ACCENT), LV_PART_MAIN);
++  lv_obj_add_event_cb(btn, ampui_show_cam, LV_EVENT_CLICKED, ui);
++
++  label = lv_label_create(btn);
++  lv_label_set_text(label, LV_SYMBOL_PLAY "  Open Camera");
++  lv_obj_set_style_text_font(label, &lv_font_montserrat_24, LV_PART_MAIN);
++  lv_obj_center(label);
++
++  ui->home_status = lv_label_create(ui->home);
++  lv_label_set_text(ui->home_status, "starting");
++  lv_obj_set_style_text_font(ui->home_status, &lv_font_montserrat_20,
++                             LV_PART_MAIN);
++  lv_obj_set_style_text_color(ui->home_status, lv_color_hex(0x8fa2b6),
++                              LV_PART_MAIN);
++  lv_obj_align(ui->home_status, LV_ALIGN_BOTTOM_MID, 0, -60);
++
++  /* The heartbeat lives on the home screen because that is the screen that can
++   * otherwise sit still. The camera screen invalidates a canvas thirty times a
++   * second and needs no help.
++   */
++
++  ui->beat = lv_obj_create(ui->home);
++  lv_obj_remove_flag(ui->beat, LV_OBJ_FLAG_SCROLLABLE);
++  lv_obj_set_size(ui->beat, 10, 10);
++  lv_obj_align(ui->beat, LV_ALIGN_BOTTOM_MID, 0, -30);
++  lv_obj_set_style_radius(ui->beat, LV_RADIUS_CIRCLE, LV_PART_MAIN);
++  lv_obj_set_style_bg_color(ui->beat, lv_color_hex(0x4caf50), LV_PART_MAIN);
++  lv_obj_set_style_border_width(ui->beat, 0, LV_PART_MAIN);
++}
++
++/****************************************************************************
++ * Name: ampui_build_cam
++ ****************************************************************************/
++
++static void ampui_build_cam(struct ampui_s *ui)
++{
++  lv_obj_t *back;
++  lv_obj_t *label;
++
++  ui->cam = lv_obj_create(NULL);
++  lv_obj_remove_flag(ui->cam, LV_OBJ_FLAG_SCROLLABLE);
++  lv_obj_set_style_bg_color(ui->cam, lv_color_black(), LV_PART_MAIN);
++  lv_obj_set_style_pad_all(ui->cam, 0, LV_PART_MAIN);
++
++  /* The canvas has no buffer yet: its size is the producer's to decide, and it
++   * is set on the first frame. Until then this screen is black, which is what
++   * the status label is for.
++   */
++
++  ui->canvas = lv_canvas_create(ui->cam);
++  lv_obj_center(ui->canvas);
++
++  back = lv_button_create(ui->cam);
++  lv_obj_set_size(back, 132, 60);
++  lv_obj_align(back, LV_ALIGN_TOP_LEFT, 16, 16);
++  lv_obj_set_style_radius(back, 30, LV_PART_MAIN);
++  lv_obj_set_style_bg_color(back, lv_color_hex(0x000000), LV_PART_MAIN);
++
++  /* Translucent rather than solid: it sits over the picture, and the pixels it
++   * covers are the ones a viewer is most likely to want to see past.
++   */
++
++  lv_obj_set_style_bg_opa(back, LV_OPA_60, LV_PART_MAIN);
++  lv_obj_add_event_cb(back, ampui_show_home, LV_EVENT_CLICKED, ui);
++
++  label = lv_label_create(back);
++  lv_label_set_text(label, LV_SYMBOL_LEFT "  Back");
++  lv_obj_set_style_text_font(label, &lv_font_montserrat_20, LV_PART_MAIN);
++  lv_obj_center(label);
++
++  ui->cam_status = lv_label_create(ui->cam);
++  lv_label_set_text(ui->cam_status, "waiting for a frame");
++  lv_obj_set_style_text_font(ui->cam_status, &lv_font_montserrat_20,
++                             LV_PART_MAIN);
++  lv_obj_set_style_text_color(ui->cam_status, lv_color_hex(0xf0f4f8),
++                              LV_PART_MAIN);
++  lv_obj_set_style_bg_color(ui->cam_status, lv_color_black(), LV_PART_MAIN);
++  lv_obj_set_style_bg_opa(ui->cam_status, LV_OPA_60, LV_PART_MAIN);
++  lv_obj_set_style_pad_all(ui->cam_status, 8, LV_PART_MAIN);
++  lv_obj_set_style_radius(ui->cam_status, 8, LV_PART_MAIN);
++  lv_obj_align(ui->cam_status, LV_ALIGN_BOTTOM_MID, 0, -16);
++}
++
++/****************************************************************************
++ * Public Functions
++ ****************************************************************************/
++
++int main(int argc, char *argv[])
++{
++  lv_nuttx_dsc_t info;
++  lv_nuttx_result_t result;
++
++  if (lv_is_initialized())
++    {
++      fprintf(stderr, "ampui: LVGL is already initialised in this process\n");
++      return EXIT_FAILURE;
++    }
++
++  memset(&g_ui, 0, sizeof(g_ui));
++  g_ui.camfd = -1;
++
++  lv_init();
++
++  lv_nuttx_dsc_init(&info);
++  lv_nuttx_init(&info, &result);
++
++  if (result.disp == NULL)
++    {
++      fprintf(stderr, "ampui: no display - is /dev/fb0 present?\n");
++      lv_deinit();
++      return EXIT_FAILURE;
++    }
++
++  /* Said out loud, because "the touch device was missing" and "Linux stopped
++   * forwarding touch" produce the same unresponsive screen and have different
++   * causes. lv_nuttx_init() only logs this through LVGL's own log.
++   */
++
++  if (result.indev == NULL)
++    {
++      fprintf(stderr, "ampui: no input device - the screen will not respond to"
++                      " touch\n");
++    }
++
++  printf("ampui: %" LV_PRId32 "x%" LV_PRId32 " display, camera from %s\n",
++         lv_display_get_horizontal_resolution(result.disp),
++         lv_display_get_vertical_resolution(result.disp),
++         AMPUI_CAM_DEV);
++
++  ampui_build_home(&g_ui);
++  ampui_build_cam(&g_ui);
++
++  /* Created paused. The camera screen is not the one being shown, and a pump
++   * running against a hidden canvas is two megabytes a frame of nothing.
++   */
++
++  g_ui.frame_timer = lv_timer_create(ampui_frame_cb, AMPUI_FRAME_MS, &g_ui);
++  lv_timer_pause(g_ui.frame_timer);
++
++  g_ui.beat_timer = lv_timer_create(ampui_beat_cb, AMPUI_BEAT_MS, &g_ui);
++
++  lv_screen_load(g_ui.home);
++
++  for (; ; )
++    {
++      uint32_t idle = lv_timer_handler();
++
++      usleep((idle ? idle : 1) * 1000);
++    }
++
++  return EXIT_SUCCESS;
++}

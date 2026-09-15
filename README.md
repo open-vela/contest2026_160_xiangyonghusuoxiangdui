@@ -64,9 +64,180 @@ LVGL 界面 + 触摸交互 + 开机自启，是可演示的产品形态，不只
 
 ---
 
-## 三、目录结构
+## 三、设计架构
 
-### 3.1 本仓目录
+一句话概括：**一颗 RK3588 SoC 内部切成三个域并行运行**——Linux 拿 7 个核负责采集与算力，
+NuttX 拿一个 A55（cpu_l3）负责画面与交互，NuttX 再拿那颗一直闲置的 PMU Cortex-M0 做第三个
+独立 RTOS 实例。三者通过 **rpmsg（rockchip mailbox + OpenAMP vring）** 与一块 **非缓存共享内存**
+协作。下面依次给出总体架构、模块组成、启动流程、三条运行期数据流，以及内存/链路的地址契约。
+
+### 3.1 总体架构：一颗 SoC 上的三个域
+
+```mermaid
+graph TB
+  subgraph SOC["RK3588 SoC · 8 核"]
+    direction TB
+    subgraph LNX["Linux 域 — cpu0-2 / cpu4-7（7 核）"]
+      LISP["ISP 采集链<br/>imx415→CSI→rkcif→rkisp0"]
+      LNPU["RKNN NPU 推理（yolov5s）"]
+      LAPP["用户态 amp_fb_show<br/>V4L2 + RGA + RKNN + 触摸转发"]
+    end
+    subgraph L3["NuttX 域 — cpu_l3 · A55 MPIDR 0x300"]
+      UI["LVGL UI（ampui）"]
+      FB["/dev/fb0 双缓冲"]
+      VOP["直驱 VOP Esmart3 硬件窗口"]
+    end
+    subgraph MC["NuttX 域 — PMU Cortex-M0 · ARMv6-M"]
+      NSHM["独立 nsh 实例"]
+    end
+  end
+  DDR["共享 DDR<br/>amp-shmem 8MB（MT_NORMAL_NC）<br/>+ rpmsg vring / buffer pool"]
+  PANEL["MIPI-DSI 屏 1080×1920"]
+  CAM["imx415 摄像头"]
+
+  CAM --> LISP --> LNPU --> LAPP
+  LAPP -->|"写帧 + 检测框"| DDR
+  DDR -->|"读帧 + 检测框"| FB
+  UI --> FB --> VOP --> PANEL
+  PANEL -.触摸.-> LNX
+  LNX <-->|"rpmsg（mailbox0 + vring）"| L3
+  LNX <-->|"rpmsg（mailbox + INTMUX）"| MC
+```
+
+要点：
+
+- **显示不经过 Linux。** NuttX 从 Linux 的 VOP 手里摘出一个硬件图层（Esmart3，reserved-plane），
+  自己双缓冲 + 原地扫描上屏；Linux 图形栈崩了，画面照在。
+- **算力不重造。** 摄像头 ISP 链和 NPU 只有 Linux 有深度驱动，NuttX 不碰硬件，只从共享内存读结果。
+- **触摸走消息通道。** 触摸控制器中断与 Type-C PD 控制器共用一个 GPIO bank，NuttX 无法独占，
+  改由 Linux 读取后经 rpmsg 转发。
+
+### 3.2 模块组成
+
+| 域 | 模块 | 源码位置 | 职责 |
+|---|---|---|---|
+| Linux | ISP 采集链 | vendor kernel（BSP） | imx415→csi2_dphy0→mipi2_csi2→rkcif→rkisp0，产出 NV12 帧 |
+| Linux | NPU 推理 | `rk3588-amp-demo/npu-a17/` | RKNN 运行时 + yolov5s 模型，输出检测框 |
+| Linux | `amp_fb_show` | `rk3588-amp-demo/amp_fb_show.c` | V4L2 采集 + RGA 转换/旋转 + RKNN 推理 + 写共享内存 + 触摸转发 |
+| Linux | rpmsg 隧道 | `kernel/drivers/tty/rpmsg_nsh_tty.c` + `rpmsg_char` | 把两个 NuttX 的 nsh 暴露成 `/dev/ttyNSH0/1` |
+| Linux | 部署 | `rk3588-amp-demo/deploy/` | 4 个 systemd unit（WiFi/BT/rpmsg/camera）+ install.sh |
+| NuttX cpu_l3 | chip 层 | `nuttx/arch/arm64/src/rk3588/` | GICv3(rdist 修复)/EL1 物理 timer/rptun/rsctable/boot MMU/serial |
+| NuttX cpu_l3 | board 层 | `nuttx/boards/arm64/rk3588/evb7-amp/` | fb / vop / cam / touch / shm / bringup |
+| NuttX cpu_l3 | 应用 | `apps/examples/ampui`、`apps/examples/ampcam` | LVGL 主页+相机页；帧查看与统计 |
+| NuttX M0 | chip 层 | `nuttx/arch/arm/src/rk3588-m0/` | irq(INTMUX→NVIC)/SysTick/rptun/lowputc/地址重映射模型 |
+| NuttX M0 | board 层 | `nuttx/boards/arm/rk3588-m0/evb7-m0/` | 启动/板级初始化/nsh |
+| 通用层修复 | — | `arm64_gicv3.c`、`arm64_arch_timer.c`、`drivers/serial/uart_rpmsg.c` | AMP 下的 3 处 NuttX 通用缺陷修复 |
+
+### 3.3 启动流程
+
+```mermaid
+flowchart TD
+  A["BootROM"] --> B["MiniLoader / SPL（DDR 初始化）"]
+  B --> C["u-boot（CONFIG_AMP + CONFIG_ROCKCHIP_AMP）"]
+  C --> D{"解析 amp.img（FIT）"}
+  D -->|"SIP_AMP_CFG 拉核"| E["NuttX @ cpu_l3（nuttx.bin）"]
+  D -->|"uc_start/uc_end 编程取指地址"| F["NuttX @ PMU M0（nuttx-m0.bin）"]
+  C --> G["boot.img → Linux kernel"]
+  G --> H["Linux 7 核 → systemd → amp_fb_show"]
+  E --> Z["三域并行运行"]
+  F --> Z
+  H --> Z
+  Z --> UI2["屏幕自动出 LVGL 主页，点相机进识别页"]
+```
+
+> ⚠️ M0 那一路的 `uc_start`/`uc_end` 不是可选项：缺了它 u-boot 会静默落进 `__weak` 空桩、
+> **照样打印 `...OK`**，而 M0 取指地址从未编程。详见 §五 的踩坑说明。
+
+### 3.4 运行期数据流
+
+**（a）相机识别链**——数据真正起源于 Linux，交接点是共享内存：
+
+```mermaid
+flowchart LR
+  subgraph L["Linux（amp_fb_show）"]
+    S1["ISP 采帧 NV12"] --> S2["RGA → XRGB8888 + 旋转/缩放"]
+    S2 --> S3["RKNN yolov5s 推理"]
+    S3 --> S4["后处理 → 检测框（≤64）"]
+  end
+  S2 --> W1["写 camera buffer<br/>@0x100000 / 0x300000（seqlock）"]
+  S4 --> W2["写 detection desc<br/>@0x003000（seqlock）"]
+  subgraph N["NuttX cpu_l3"]
+    R1["cam 消费端读帧（seqlock 校验）"] --> R2["合成到 /dev/fb0"]
+    R3["读检测框"] --> R2
+    R2 --> R4["VOP Esmart3 扫描上屏"]
+  end
+  W1 --> R1
+  W2 --> R3
+```
+
+**（b）显示回路 + （c）触摸与 nsh 通道**——显示全程不出 NuttX；触摸与控制台走 rpmsg：
+
+```mermaid
+flowchart TD
+  subgraph NX["NuttX cpu_l3"]
+    LVGL["LVGL 事件循环"]
+    TP["touch 输入设备"]
+    NSH["nsh 控制台"]
+    FBN["/dev/fb0"]
+  end
+  subgraph LX["Linux"]
+    TCTRL["触摸控制器读取<br/>（GPIO 与 Type-C PD 共享 bank）"]
+    TTY["/dev/ttyNSH0（rpmsg_nsh_tty）"]
+  end
+  LVGL --> FBN -->|"双缓冲 + 原地扫描"| VOPD["VOP Esmart3"] --> SCR["MIPI-DSI 屏"]
+  TCTRL -->|"rpmsg CMD_TOUCH（16B）"| TP --> LVGL
+  NSH <-->|"rpmsg-tty（共享 UART2）"| TTY
+```
+
+三条消息/数据通道的载体各不相同，取决于「数据是流还是快照」：
+
+- **触摸 = 事件流** → 定长 16 字节 rpmsg 消息（`CMD_TOUCH`）。
+- **检测框 = 快照**（一帧内全部框、数量可变）→ 共享内存 + seqlock，一次读到全一致的一组。
+- **相机帧 = 大块图像** → 共享内存 2MB 槽 + seqlock。
+
+### 3.5 地址与链路契约
+
+**内存布局**（Linux dts 保留 + NuttX 侧 MMU 映射，两侧必须一致）：
+
+| 区域 | 地址 | 大小 | 说明 |
+|---|---|---|---|
+| amp-core | `0x30000000` | 16MB（no-map） | NuttX cpu_l3 固件代码/数据 |
+| amp-shmem | `0x31000000` | 8MB（no-map, MT_NORMAL_NC） | 帧/相机/检测/触摸共享区（非缓存，免 cache 维护） |
+| rpmsg vring0 / vring1 | `0x07c00000` / `0x07c08000` | — | cpu_l3 ↔ Linux 环形队列 |
+| rpmsg buffer pool | `0x08000000` | — | rpmsg 数据缓冲 |
+| M0 心跳计数 / 取指窗口 | `0x07ae0000` / `0x60000000` | — | M0 活体递增计数 / M0 访问共享 DDR 的窗口 |
+| UART2 | `0xfeb50000` | — | u-boot/Linux/NuttX 共享控制台，1500000 8N1 |
+| GICD / GICR(cpu_l3) | `0xfe600000` / `0xfe6c0000` | — | 中断分发 / 本核 redistributor（按 MPIDR 亲和度定位） |
+
+**amp-shmem 内部布局**（契约唯一定义在 `evb7_amp_shm.h`，Linux 侧持一份副本）：
+
+| 偏移 | 内容 | 写者 → 读者 |
+|---|---|---|
+| `0x000000` | 保留首页 4KB | 项目外未知写者，整块跳过 |
+| `0x001000` | fb 控制块 | NuttX → Linux |
+| `0x002000` | 相机描述符 | Linux → NuttX |
+| `0x003000` | 检测结果描述符（≤64 框） | Linux → NuttX |
+| `0x100000` | 相机 buffer 0（2MB 槽） | Linux → NuttX |
+| `0x300000` | 相机 buffer 1（2MB 槽） | Linux → NuttX |
+| `0x500000` | 备用 3MB | — |
+
+**rpmsg 链路**：
+
+| 链路 | 载体 | 机制 |
+|---|---|---|
+| cpu_l3 ↔ Linux | mailbox0 + 固定 vring | **TX** 事件驱动（写 B2A_DAT+B2A_CMD 敲门铃）；**RX** 轮询 A2B_STATUS（中断被 GIC Group0 挡住，代码保留完整中断路径，secure 侧放开即接管） |
+| M0 ↔ Linux | mailbox + INTMUX→NVIC | 中断驱动收发 |
+| nsh 隧道 | rpmsg-tty | 两个 NuttX 的 nsh → Linux `/dev/ttyNSH0`(cpu_l3) / `/dev/ttyNSH1`(M0)，不占物理 UART |
+
+> 这些地址与偏移为什么是这些值、每一个踩过的坑（如 amp-shmem 从 4MB 长到 8MB 要同时改 dts、
+> MMU 表、头文件三处），逐条记录在 `logs/.kiro/board-changes/rk3588-evb7-v11.md`。
+> 源码/patch 的具体位置见 §四，构建与刷机见 §五。
+
+---
+
+## 四、目录结构
+
+### 4.1 本仓目录
 
 ```text
 contest2026_160_xiangyonghusuoxiangdui/
@@ -88,20 +259,35 @@ contest2026_160_xiangyonghusuoxiangdui/
 │   ├── npu-a17/                       RKNN 运行时（librknnrt.so / librga.so / yolov5s 模型 / 标签）
 │   ├── tests/                         主机侧回归：yolo 解码对比 + emit + 触摸解码
 │   └── _a55_backup/                   各里程碑 amp.img 备份（回退用，对应关系见 SETUP）
-├── app/hello_app/                     应用形态占位（本作品的 NuttX 应用见 §3.2）
-├── board/contest_board/               板级形态占位（本作品的板级代码见 §3.2）
+├── demo-video/                        ★ 成品演示材料（真机录制）
+│   ├── evb7演示.mp4                    实机演示视频（三域并行 + 相机识别 + 触摸 UI）
+│   ├── 技术报告.md / 技术报告.pdf      技术报告
+│   ├── 演示日志ttyUSB0_20260906_184139.log  完整开机串口日志（三域启动全过程）
+│   └── 演示日志log.log / 演示日志log1.log    关键片段日志
+├── board/                             ★ 本作品对四棵上游源码树的改动（相对上游基线的合并 diff，见 §4.3）
+│   ├── Rockchip_kernel/
+│   │   └── rk3588-evb7-v11-amp-kernel.patch      内核（8 文件）：AMP dts、G610/WiFi-BT config、rpmsg_nsh_tty
+│   ├── Rockchip_u-boot/
+│   │   └── rk3588-evb7-v11-amp-uboot.patch       u-boot（1 文件）：rk3588_defconfig 开 CONFIG_AMP
+│   ├── nuttx/
+│   │   └── rk3588-evb7-v11-amp-nuttx.patch       NuttX（68 文件）：两套 chip 层 + 两套 board 层 + 3 处通用 arch 修复
+│   ├── apps/
+│   │   └── rk3588-evb7-v11-amp-apps.patch        NuttX apps（8 文件）：examples/ampui + examples/ampcam
+│   └── contest_board/                            赛题板级形态占位骨架（模板，非本作品代码）
+├── app/hello_app/                     应用形态占位（本作品的 NuttX 应用见 §4.2）
 ├── quickapp/hello_quickapp/           快应用占位（本作品未使用）
-└── logs/                              AI Coding 日志（见 §五）
+└── logs/                              AI Coding 日志（见 §六）
     ├── e0295e74ccbf7137/              Kiro 会话原始记录（session.json + messages.jsonl）
     ├── e0295e74ccbf7137.jsonl         会话索引
     └── .kiro/
-        ├── board-changes/             ★ 开发全过程的工程日志，见下
-        │   ├── rk3588-evb7-v11.md              主 changelog，6700+ 行，逐个里程碑
-        │   ├── SETUP-rk3588-evb7-v11.md        从零搭建手册（评委复现看这份）
-        │   ├── HANDOFF-rk3588-evb7-v11.md      跨会话交接文档
-        │   ├── rk3588-evb7-v11-AMP-overview.md
-        │   └── rk3588-evb7-v11-SESSION-SUMMARY.md
-        └── skills/                    自定义 AI skill（见 §五）
+        ├── board-changes/             ★ 开发全过程的工程日志，见 §4.4
+        │   ├── rk3588-evb7-v11.md                                 主 changelog，6684 行，逐个里程碑
+        │   ├── SETUP-rk3588-evb7-v11.md                           从零搭建手册（评委复现看这份）
+        │   ├── HANDOFF-rk3588-evb7-v11.md                         板级适配 + NuttX AMP 移植交接
+        │   ├── HANDOFF-rk3588-amp-peripheral-sharing-20260730.md  外设共享机制调研（VOP/NPU/触摸/摄像头）
+        │   ├── rk3588-evb7-v11-AMP-overview.md                    AMP 项目总览（拓扑 / 交付栈）
+        │   └── rk3588-evb7-v11-SESSION-SUMMARY.md                 会话交接总结（能力矩阵）
+        └── skills/                    自定义 AI skill（见 §六）
             ├── board-change-tracker/
             └── session-handoff/
 ```
@@ -110,20 +296,22 @@ contest2026_160_xiangyonghusuoxiangdui/
 > 它按里程碑记录了每一步改了什么、为什么、真机验证结果，以及**每一次判断错误和它的根因**
 > （包括三次被"看起来像成功的返回值"骗到的经过）。这份文档本身就是 AI 协作的产物与证据。
 
-### 3.2 作品主体源码位置
+### 4.2 改动仓库汇总
 
-本作品跨 6 棵源码树，`repo sync` 后位于 openvela 工作区中：
+下表列出本项目**发生过代码改动**的全部仓库，及其远端地址（fork 分支 / 上游 PR）。
+这些树 `repo sync` 后位于 openvela 工作区中。
 
-| 树 | 路径 | 本作品的改动 |
-|---|---|---|
-| NuttX | `nuttx/` | **73 个文件**：两套 chip 层（arm64 rk3588 / arm rk3588-m0）、两套 board 层、3 处通用 arch 修复 |
-| NuttX apps | `apps/` | `examples/ampui/`（LVGL 主页+相机页）、`examples/ampcam/`（帧查看与统计） |
-| Linux 内核 | 外部 BSP 树 | AMP dts、Mali G610 / WiFi-BT 两个 config fragment、`drivers/tty/rpmsg_nsh_tty.c` |
-| u-boot | 外部 vendor 树 | `configs/rk3588_defconfig` 开 `CONFIG_AMP` |
-| AMP 载荷与 Linux 用户态 | `rk3588-amp-demo/` | `amp_fb_show.c`（采集/转换/推理/旋转/发布）、FIT 描述、systemd unit、主机侧回归测试 |
-| 构建记录 | 本仓 `logs/.kiro/` | changelog + skills |
+| 仓库 | 本地路径 | 分支 | 改动内容概述 | GitHub |
+|------|---------|------|-------------|--------|
+| kernel（Rockchip BSP 6.1.141） | `/media/1t/openvela/kernel` | develop-6.1 | AMP dts（`rk3588-evb7-v11-linux-amp.dts`：cpu_l3 摘核、amp/rpmsg 保留区、reserved-plane、关 vop_mmu）；kernel fragment `rk3588_g610.config` / `rk3588_wifibt.config`；新驱动 `drivers/tty/rpmsg_nsh_tty.c`；`rpmsg_char`/`rpmsg_ctrl`/`rockchip_rpmsg_test` 配置 | [C-Ackerman/kernel @rk3588-evb7-v11](https://github.com/C-Ackerman/kernel/tree/rk3588-evb7-v11) |
+| u-boot（vendor 2017.09） | `/media/1t/openvela/u-boot` | next-dev | `configs/rk3588_defconfig` 追加 `CONFIG_AMP=y` + `CONFIG_ROCKCHIP_AMP=y` | [C-Ackerman/u-boot @rk3588-evb7-v11](https://github.com/C-Ackerman/u-boot/tree/rk3588-evb7-v11) |
+| work/nuttx（openvela NuttX） | `/media/1t/openvela/work/nuttx` | 0712 | 新增 arm64 chip 层 `arch/arm64/src/rk3588/`（GICv3 rdist 修复、EL1 物理 timer、rptun、rsctable、共享内存非缓存）+ board `boards/arm64/rk3588/evb7-amp/`（fb/touch/shm/vop/cam）；新增 armv6-m chip 层 `arch/arm/src/rk3588-m0/` + board `boards/arm/rk3588-m0/evb7-m0/`；通用驱动 `drivers/serial/uart_rpmsg.c` re-announce 改动 | [fork @rk3588-evb7-v11](https://github.com/C-Ackerman/nuttx-openvela/tree/rk3588-evb7-v11)<br>上游 PR [open-vela/nuttx#382](https://github.com/open-vela/nuttx/pull/382) |
+| work/apps（openvela apps） | `/media/1t/openvela/work/apps` | 0801 | 新增 `examples/ampcam`（相机帧读取+画框）、`examples/ampui`（LVGL 主页+相机页） | [fork @rk3588-evb7-v11](https://github.com/C-Ackerman/nuttx-apps-openvela/tree/rk3588-evb7-v11)<br>上游 PR [open-vela/nuttx-apps#127](https://github.com/open-vela/nuttx-apps/pull/127) |
+| rk3588-amp-demo（AMP 载荷 + Linux 用户态） | `/media/1t/openvela/rk3588-amp-demo` | master | amp.img 打包（`amp-m0-nuttx.its` / `parameter-amp.txt`）；Linux 侧 `amp_fb_show.c`（采集/NPU/显示/触摸转发）；M0 裸机固件 `m0/`；诊断工具 `amp_shm_*.c` / `amp_rga_probe.c` / `amp_isp_range.c` / `amp_npu_probe.c`；部署 `deploy/`（systemd unit + install.sh）；`tests/` | [open-vela/contest2026_160_xiangyonghusuoxiangdui](https://github.com/open-vela/contest2026_160_xiangyonghusuoxiangdui) |
 
-各文件逐条清单见 `logs/.kiro/board-changes/rk3588-evb7-v11.md` 的各里程碑「改动」表。
+> `board/` 下的四份 patch（§4.3）就是上表 kernel / u-boot / nuttx / apps 四棵树相对各自上游基线的净 diff；
+> `rk3588-amp-demo/` 直接随本仓提交。各文件逐条清单见
+> `logs/.kiro/board-changes/rk3588-evb7-v11.md` 的各里程碑「改动」表。
 
 **关键源码导航**（想直接看代码的话）：
 
@@ -140,14 +328,69 @@ apps/examples/ampui/ampui_main.c                   LVGL 应用
 rk3588-amp-demo/amp_fb_show.c                      Linux 侧：V4L2 + RGA + RKNN + 发布
 ```
 
+### 4.3 `board/` — 改动 patch（相对上游基线的合并 diff）
+
+§4.2 的改动散落在工作区外的四棵源码树里，不便随本仓一起提交与评审。因此 `board/`
+下按目标树各存一份**相对该树上游基线的合并 diff**，是"我们相对上游到底改了什么"的完整快照。
+
+| patch | 目标源码树 | 上游基线 | 变更量 |
+|---|---|---|---|
+| `board/Rockchip_kernel/rk3588-evb7-v11-amp-kernel.patch` | Linux 内核（vendor BSP 6.1） | `origin/develop-6.1`（`b4ef083`） | 8 文件，+712 |
+| `board/Rockchip_u-boot/rk3588-evb7-v11-amp-uboot.patch` | u-boot（vendor 2017.09） | `origin/next-dev`（`aeec6f2`） | 1 文件，+2 |
+| `board/nuttx/rk3588-evb7-v11-amp-nuttx.patch` | openvela / NuttX | dev-ai-contest-2026 分叉点（`a6defdb`） | 68 文件，+11375 / -9 |
+| `board/apps/rk3588-evb7-v11-amp-apps.patch` | openvela / NuttX apps | `openvela/dev-ai-contest-2026`（`4a914a2`） | 8 文件，+1759 |
+
+**内容对应关系：**
+
+- **Rockchip_kernel**：AMP 版 dts（`rk3588-evb7-v11-linux-amp.dts`，为 cpu_l3 让出 Esmart3、
+  划出 `amp` 保留内存）、`rk3588_g610.config` / `rk3588_wifibt.config` 两个 config fragment、
+  以及新增驱动 `drivers/tty/rpmsg_nsh_tty.c`（把两个 NuttX 的 nsh 隧道成 `/dev/ttyNSH*`）。
+- **Rockchip_u-boot**：仅 `configs/rk3588_defconfig` 打开 `CONFIG_AMP` / `CONFIG_ROCKCHIP_AMP`
+  （烤进 defconfig 而非 merged .config，因为 `make.sh` 每次重跑 defconfig 会冲掉后者）。
+- **nuttx**：主体工作量所在——`arch/arm64/src/rk3588/`（cpu_l3 chip 层）、
+  `arch/arm/src/rk3588-m0/`（PMU Cortex-M0 chip 层）、两套 board 层
+  （`boards/arm64/rk3588/evb7-amp/`、`boards/arm/rk3588-m0/evb7-m0/`），以及 3 处通用层修复
+  （`arm64_gicv3.c`、`arm64_arch_timer.c`、`drivers/serial/uart_rpmsg.c`）。
+- **apps**：`examples/ampui/`（LVGL 主页 + 相机页）与 `examples/ampcam/`（帧查看与统计）。
+
+**应用方式**（把 patch 打回对应源码树）：
+
+```bash
+cd <对应源码树>            # 如 <openvela>/nuttx
+git apply --check /path/to/board/nuttx/rk3588-evb7-v11-amp-nuttx.patch   # 先试打
+git apply         /path/to/board/nuttx/rk3588-evb7-v11-amp-nuttx.patch
+#   或不依赖 git： patch -p1 < /path/to/.../xxx.patch
+```
+
+> patch 是从各树当前的 `rk3588-evb7-v11` 开发分支相对上述基线导出的净 diff（不含提交历史）。
+> 逐个文件、逐条改动的说明见 §4.4 的主 changelog。`board/contest_board/` 是赛题给的板级形态
+> 占位模板，**不是**本作品代码。
+
+### 4.4 `logs/.kiro/board-changes/` — 开发全过程工程日志
+
+本作品最完整的过程记录，全部由 AI 协作实时产出（见 §六）。按用途分：
+
+| 文件 | 行数 | 用途 |
+|---|---|---|
+| `rk3588-evb7-v11.md` | 6684 | **主 changelog**。逐个里程碑记录改了什么 / 为什么 / 真机验证结果，含每次判断错误的根因。理解本作品最快的入口 |
+| `SETUP-rk3588-evb7-v11.md` | 739 | **从零搭建手册**。评委复现看这份：官方固件基线 → 分区表改造 → 四套工具链 → 编译刷机部署 → 验证 → 回退 |
+| `HANDOFF-rk3588-evb7-v11.md` | 139 | 板级适配 + NuttX AMP 移植的跨会话交接（源码树位置、分支、一句话现状） |
+| `HANDOFF-rk3588-amp-peripheral-sharing-20260730.md` | 742 | 外设共享机制专项调研（VOP / NPU / 触摸 / 摄像头哪些可分给 AMP 核），纯代码考古 + `path:line` 引用 |
+| `rk3588-evb7-v11-AMP-overview.md` | 195 | AMP 项目总览：SoC / 板卡 / 三域拓扑 / 交付栈 |
+| `rk3588-evb7-v11-SESSION-SUMMARY.md` | 164 | 会话交接总结：AMP / 桌面 / WiFi / 蓝牙能力矩阵与现状 |
+
+> 阅读顺序建议：先 `rk3588-evb7-v11-AMP-overview.md` 建立全局，再按需查
+> `rk3588-evb7-v11.md`（细节）或 `SETUP-rk3588-evb7-v11.md`（复现）。
+> 同目录 `../skills/` 下的两个自定义 AI skill 是这批日志得以持续产出的机制，见 §6.1。
+
 ---
 
-## 四、运行方式
+## 五、运行方式
 
 > 完整版（含官方固件基线、分区表改造、四套工具链、回退方案、13 条踩坑速查）见
 > **`logs/.kiro/board-changes/SETUP-rk3588-evb7-v11.md`**。下面是骨架流程。
 
-### 4.0 硬件与前提
+### 5.0 硬件与前提
 
 - RK3588 EVB7 V11 开发板（MIPI-DSI 屏、imx415 摄像头、AP6398S WiFi/BT）
 - 串口 **UART2 @ 1500000** 8N1，Linux 控制台 `ttyFIQ0`
@@ -163,7 +406,7 @@ rk3588-amp-demo/amp_fb_show.c                      Linux 侧：V4L2 + RGA + RKNN
 | NuttX cpu_l3 | `aarch64-none-elf`（openvela prebuilts） |
 | NuttX M0 | `arm-none-eabi`（openvela prebuilts） |
 
-### 4.1 先刷官方固件，确认板子是好的
+### 5.1 先刷官方固件，确认板子是好的
 
 **不要跳过。** 后续都是在这个基线上做增量，出问题时需要能回退区分硬件还是改动。
 
@@ -176,7 +419,7 @@ for p in uboot boot rootfs oem userdata; do rkdeveloptool wlx $p $p.img; done
 rkdeveloptool rd
 ```
 
-### 4.2 编译
+### 5.2 编译
 
 ```bash
 # --- u-boot（AMP 已烤进 defconfig，因为 make.sh 每次重跑 defconfig 会冲掉 merged .config）
@@ -225,7 +468,7 @@ aarch64-linux-gnu-gcc -O2 -ftree-vectorize -Wall -Wextra -pthread -DAMP_WITH_RKN
 > 缺了它，u-boot 会静默落进 `__weak` 空桩、**照样打印 `...OK`**，而 M0 的取指地址从未编程、
 > 复位从未解除。这个坑吃掉了两轮上板。
 
-### 4.3 刷机（首次，含改分区表加 `amp` 分区）
+### 5.3 刷机（首次，含改分区表加 `amp` 分区）
 
 ```bash
 cd <rk3588-amp-demo>
@@ -244,7 +487,7 @@ rkdeveloptool rd
 日常只改 NuttX 时：`rkdeveloptool db <spl_loader>; wlx amp amp.img; rd`（几秒钟）。
 改了 dts 才需要连 `boot` 一起刷。
 
-### 4.4 板上部署
+### 5.4 板上部署
 
 ```bash
 adb push <kernel>/drivers/net/wireless/rockchip_wlan/rkwifi/bcmdhd/bcmdhd.ko /lib/modules/
@@ -265,7 +508,7 @@ adb shell reboot
 因为 `enable` 只建符号链接、不读文件内容，一个丢了 `[Unit]` 头的 unit 能被完美 enable，
 然后那一节里所有排序指令被静默丢弃（我们踩过）。
 
-### 4.5 验证
+### 5.5 验证
 
 重启后**不需要任何命令**，屏幕上应出现 LVGL 主页（带呼吸心跳点），
 点相机图标进入相机页，看到实时画面与人物识别框。
@@ -292,12 +535,12 @@ journalctl -u amp-camera -f
 
 ---
 
-## 五、AI Coding 使用说明
+## 六、AI Coding 使用说明
 
 本作品**全程由 Kiro 辅助开发**。完整对话日志见 `logs/`，工程日志见
 `logs/.kiro/board-changes/`。这里说明协作方式，以及 AI 在哪些地方真正起了作用。
 
-### 5.1 协作方式：让 AI 维护一份"工程日志"，而不是只写代码
+### 6.1 协作方式：让 AI 维护一份"工程日志"，而不是只写代码
 
 这个项目的难点不在于单个函数怎么写，而在于**跨 6 棵源码树、几十个里程碑、每次验证都要重新刷机**，
 上下文极易丢失。所以我们做的第一件事是给 Kiro 写了两个自定义 skill：
@@ -311,7 +554,7 @@ journalctl -u amp-camera -f
 每个里程碑的判据、真机日志片段、产物 md5、以及"这个数字为什么不可复现"都记在里面。
 `SETUP-rk3588-evb7-v11.md` 与本 README 都是从它整理出来的。
 
-### 5.2 各环节的实际分工
+### 6.2 各环节的实际分工
 
 **需求拆解 / 方案设计。** 关键决策都是先让 AI 把可选路径的代价量化再拍板。例：
 显示要不要让 NuttX 独占硬件？AI 去读了 rkcif/rkisp/vop2 的源码，指出
@@ -336,7 +579,7 @@ journalctl -u amp-camera -f
 
 **文档。** changelog、SETUP 手册、本 README 都由 AI 起草，人校对。
 
-### 5.3 一个我们认为更有价值的产出：把判断错误也记下来
+### 6.3 一个我们认为更有价值的产出：把判断错误也记下来
 
 changelog 里专门留了「方法论」条目，记录**每一次判断错误的根因模式**，因为同一类错误反复出现：
 
@@ -359,7 +602,7 @@ changelog 里专门留了「方法论」条目，记录**每一次判断错误�
 把从 TRM 推出的四个数字固化下来（`MBOX_RX_INTID == 99` 等），
 因为 IRQ 号算错的症状是**静默退化**：中断永不触发、被 100ms 兜底悄悄扛住、功能看起来完全正常。
 
-### 5.4 AI 带来的实际帮助
+### 6.4 AI 带来的实际帮助
 
 - **读 vendor 代码的成本大幅下降。** RK3588 的 BSP 内核 + vendor u-boot 是几十万行、
   几乎无文档。绝大多数关键结论（mailbox 握手要先写 DAT 再写 CMD、rockchip Linux 从不读
